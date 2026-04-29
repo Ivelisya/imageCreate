@@ -5,9 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createOwnerAccount,
   createGenerationJob,
+  deleteGenerationJobs,
   deleteGenerationJob,
   getGenerationJob,
   getOwnerAccount,
+  listGenerationJobsByIds,
   listActiveGenerationJobs,
   listGenerationJobsPage,
   listGenerationJobs,
@@ -252,6 +254,175 @@ describe("generation job store", () => {
       total: 3,
       totalPages: 2
     });
+  });
+
+  it("filters paginated history by prompt, status and mode", async () => {
+    const databasePath = await createDatabasePath();
+    await createGenerationJob(
+      {
+        dragonTaskId: "task_text",
+        mode: "text",
+        prompt: "quiet landscape",
+        resolution: "2k",
+        size: "1:1",
+        status: "completed",
+        progress: 100,
+        inputImages: [],
+        outputImages: ["https://example.com/text.png"],
+        errorMessage: null
+      },
+      databasePath
+    );
+    const matching = await createGenerationJob(
+      {
+        dragonTaskId: "task_image",
+        mode: "image",
+        prompt: "boss poster with warm light",
+        resolution: "2k",
+        size: "1:1",
+        status: "completed",
+        progress: 100,
+        inputImages: [],
+        outputImages: ["https://example.com/image.png"],
+        errorMessage: null
+      },
+      databasePath
+    );
+    await createGenerationJob(
+      {
+        dragonTaskId: "task_failed",
+        mode: "image",
+        prompt: "boss poster failed draft",
+        resolution: "2k",
+        size: "1:1",
+        status: "failed",
+        progress: 100,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: "failed"
+      },
+      databasePath
+    );
+
+    await expect(
+      listGenerationJobsPage(databasePath, {
+        mode: "image",
+        page: 1,
+        pageSize: 5,
+        query: "poster",
+        status: "completed"
+      })
+    ).resolves.toMatchObject({
+      jobs: [matching],
+      total: 1,
+      totalPages: 1
+    });
+  });
+
+  it("bulk deletes selected non-active jobs and reports skipped active records", async () => {
+    const databasePath = await createDatabasePath();
+    const active = await createGenerationJob(
+      {
+        dragonTaskId: "task_active",
+        mode: "text",
+        prompt: "still running",
+        resolution: "2k",
+        size: "1:1",
+        status: "submitted",
+        progress: 10,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: null
+      },
+      databasePath
+    );
+    const completed = await createGenerationJob(
+      {
+        dragonTaskId: "task_completed",
+        mode: "text",
+        prompt: "done",
+        resolution: "2k",
+        size: "1:1",
+        status: "completed",
+        progress: 100,
+        inputImages: [],
+        outputImages: ["https://example.com/done.png"],
+        errorMessage: null
+      },
+      databasePath
+    );
+    const failed = await createGenerationJob(
+      {
+        dragonTaskId: "task_failed",
+        mode: "text",
+        prompt: "failed",
+        resolution: "2k",
+        size: "1:1",
+        status: "failed",
+        progress: 100,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: "failed"
+      },
+      databasePath
+    );
+
+    await expect(
+      deleteGenerationJobs(
+        {
+          ids: [active.id, completed.id, "missing-id"]
+        },
+        databasePath
+      )
+    ).resolves.toEqual({
+      deletedCount: 1,
+      notFoundIds: ["missing-id"],
+      skippedActive: 1
+    });
+    const remainingJobs = await listGenerationJobsByIds([active.id, completed.id, failed.id], databasePath);
+
+    expect(remainingJobs.map((job) => job.id).sort()).toEqual([active.id, failed.id].sort());
+  });
+
+  it("bulk deletes by safe scope without removing active jobs", async () => {
+    const databasePath = await createDatabasePath();
+    const active = await createGenerationJob(
+      {
+        dragonTaskId: "task_active_scope",
+        mode: "text",
+        prompt: "still running",
+        resolution: "2k",
+        size: "1:1",
+        status: "pending",
+        progress: 10,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: null
+      },
+      databasePath
+    );
+    await createGenerationJob(
+      {
+        dragonTaskId: "task_failed_scope",
+        mode: "text",
+        prompt: "failed",
+        resolution: "2k",
+        size: "1:1",
+        status: "failed",
+        progress: 100,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: "failed"
+      },
+      databasePath
+    );
+
+    await expect(deleteGenerationJobs({ scope: "failed" }, databasePath)).resolves.toEqual({
+      deletedCount: 1,
+      notFoundIds: [],
+      skippedActive: 0
+    });
+    await expect(listGenerationJobs(databasePath)).resolves.toEqual([active]);
   });
 
   it("lists active jobs without returning completed history", async () => {

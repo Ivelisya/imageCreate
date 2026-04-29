@@ -221,4 +221,73 @@ describe("generation poller", () => {
       outputImages: ["https://example.com/final.png"]
     });
   });
+
+  it("limits concurrent DragonCode task queries when many jobs are refreshed together", async () => {
+    const first = await createGenerationJob({
+      clientRequestId: "concurrency-one",
+      dragonTaskId: "task_concurrency_one",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "one",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    const second = await createGenerationJob({
+      clientRequestId: "concurrency-two",
+      dragonTaskId: "task_concurrency_two",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "two",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    let running = 0;
+    let maxRunning = 0;
+    const resolvePolls: Array<() => void> = [];
+
+    vi.mocked(fetchDragonTask).mockImplementation(
+      (async (_apiKey: string, dragonTaskId: string) => {
+        running += 1;
+        maxRunning = Math.max(maxRunning, running);
+
+        await new Promise<void>((resolve) => {
+          resolvePolls.push(() => {
+            running -= 1;
+            resolve();
+          });
+        });
+
+        return {
+          dragonTaskId,
+          errorMessage: null,
+          outputUrls: [],
+          progress: 5,
+          status: "pending"
+        };
+      }) as typeof fetchDragonTask
+    );
+
+    const firstPoll = pollGenerationJobOnce(first.id, { maxConcurrentFetches: 1 });
+    const secondPoll = pollGenerationJobOnce(second.id, { maxConcurrentFetches: 1 });
+    await vi.waitFor(() => expect(resolvePolls.length).toBeGreaterThan(0));
+
+    expect(maxRunning).toBe(1);
+    expect(resolvePolls).toHaveLength(1);
+    resolvePolls.shift()?.();
+    await vi.waitFor(() => expect(resolvePolls).toHaveLength(1));
+    expect(maxRunning).toBe(1);
+    resolvePolls.shift()?.();
+
+    await Promise.all([firstPoll, secondPoll]);
+    expect(vi.mocked(fetchDragonTask)).toHaveBeenCalledTimes(2);
+    expect(maxRunning).toBe(1);
+  });
 });

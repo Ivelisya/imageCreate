@@ -16,7 +16,8 @@ import {
   listGenerationJobsPage,
   reserveGenerationJob,
   updateGenerationJob,
-  type GenerationJob
+  type GenerationJob,
+  type GenerationJobStatusFilter
 } from "@/lib/store";
 import {
   fileToDataUri,
@@ -27,6 +28,15 @@ import {
 
 const DEFAULT_HISTORY_PAGE_SIZE = 5;
 const MAX_HISTORY_PAGE_SIZE = 30;
+const STALE_RESERVED_JOB_MS = 2 * 60 * 1000;
+const validStatusFilters = new Set<GenerationJobStatusFilter>([
+  "active",
+  "completed",
+  "failed",
+  "pending",
+  "submitted",
+  "terminal"
+]);
 
 type ParsedGenerationRequest = {
   prompt: string;
@@ -61,6 +71,22 @@ function normalizeClientRequestId(value: unknown): string | null {
   const trimmed = value.trim();
 
   return trimmed.length > 0 && trimmed.length <= 160 ? trimmed : null;
+}
+
+function parseStatusFilter(value: string | null): GenerationJobStatusFilter | undefined {
+  return value && validStatusFilters.has(value as GenerationJobStatusFilter)
+    ? (value as GenerationJobStatusFilter)
+    : undefined;
+}
+
+function parseModeFilter(value: string | null): GenerationMode | undefined {
+  return value === "text" || value === "image" ? value : undefined;
+}
+
+function parseSearchQuery(value: string | null): string | undefined {
+  const trimmed = value?.trim().slice(0, 160) ?? "";
+
+  return trimmed || undefined;
 }
 
 async function withSubmissionLock<T>(
@@ -219,6 +245,16 @@ function generationSubmissionErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "生成任务提交失败。";
 }
 
+function isStaleReservedJobWithoutDragonTask(job: GenerationJob): boolean {
+  if (job.status !== "pending" || job.dragonTaskId) {
+    return false;
+  }
+
+  const createdAtMs = Date.parse(job.createdAt);
+
+  return Number.isFinite(createdAtMs) && Date.now() - createdAtMs > STALE_RESERVED_JOB_MS;
+}
+
 async function submitAndCreateGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<GenerationJob> {
@@ -262,9 +298,26 @@ async function reserveSubmitAndUpdateGenerationJob(
   });
 
   if (!reserved.created) {
+    if (isStaleReservedJobWithoutDragonTask(reserved.job)) {
+      return {
+        job: await submitAndUpdateReservedGenerationJob(reserved.job, parsed),
+        created: false
+      };
+    }
+
     return reserved;
   }
 
+  return {
+    job: await submitAndUpdateReservedGenerationJob(reserved.job, parsed),
+    created: true
+  };
+}
+
+async function submitAndUpdateReservedGenerationJob(
+  job: GenerationJob,
+  parsed: ParsedGenerationRequest
+): Promise<GenerationJob> {
   try {
     const dragonTaskId = await submitDragonGeneration(getDragonApiKey(), {
       prompt: parsed.prompt,
@@ -272,26 +325,23 @@ async function reserveSubmitAndUpdateGenerationJob(
       size: parsed.size,
       imageUrls: parsed.imageUrls
     });
-    const submitted = await updateGenerationJob(reserved.job.id, {
+    const submitted = await updateGenerationJob(job.id, {
       dragonTaskId,
       status: "submitted",
       progress: 0,
       errorMessage: null
     });
 
-    return {
-      job: submitted ?? reserved.job,
-      created: true
-    };
+    return submitted ?? job;
   } catch (error) {
     const message = generationSubmissionErrorMessage(error);
-    const failed = await updateGenerationJob(reserved.job.id, {
+    const failed = await updateGenerationJob(job.id, {
       status: "failed",
       progress: 100,
       errorMessage: message
     });
 
-    throw new GenerationSubmissionError(message, failed ?? reserved.job);
+    throw new GenerationSubmissionError(message, failed ?? job);
   }
 }
 
@@ -320,7 +370,16 @@ export async function GET(request: NextRequest) {
     parsePositiveInteger(request.nextUrl.searchParams.get("pageSize"), DEFAULT_HISTORY_PAGE_SIZE),
     MAX_HISTORY_PAGE_SIZE
   );
-  const result = await listGenerationJobsPage(undefined, { page, pageSize });
+  const status = parseStatusFilter(request.nextUrl.searchParams.get("status"));
+  const mode = parseModeFilter(request.nextUrl.searchParams.get("mode"));
+  const query = parseSearchQuery(request.nextUrl.searchParams.get("q"));
+  const result = await listGenerationJobsPage(undefined, {
+    mode,
+    page,
+    pageSize,
+    query,
+    status
+  });
   const jobs = result.jobs.map(normalizeGenerationJobForResponse);
   void startActiveGenerationPolling();
 

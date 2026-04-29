@@ -40,6 +40,30 @@ export type GenerationJobsPage = {
   totalPages: number;
 };
 
+export type GenerationJobStatusFilter = GenerationStatus | "active" | "terminal";
+
+export type GenerationJobListOptions = {
+  page?: number;
+  pageSize?: number;
+  query?: string;
+  status?: GenerationJobStatusFilter;
+  mode?: GenerationMode;
+};
+
+export type DeleteGenerationJobsScope = "completed" | "failed" | "all";
+
+export type DeleteGenerationJobsOptions = {
+  ids?: string[];
+  scope?: DeleteGenerationJobsScope;
+  includeActive?: boolean;
+};
+
+export type DeleteGenerationJobsResult = {
+  deletedCount: number;
+  skippedActive: number;
+  notFoundIds: string[];
+};
+
 export type OwnerAccount = {
   username: string;
   passwordHash: string;
@@ -137,7 +161,79 @@ async function writeStore(data: StoreData, databasePath = getDatabasePath()): Pr
 }
 
 function sortNewestFirst(jobs: GenerationJob[]): GenerationJob[] {
-  return [...jobs].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return [...jobs].sort((left, right) => {
+    const createdAtOrder = right.createdAt.localeCompare(left.createdAt);
+
+    return createdAtOrder === 0 ? right.id.localeCompare(left.id) : createdAtOrder;
+  });
+}
+
+function normalizeSearchQuery(value: string | undefined): string {
+  return typeof value === "string" ? value.trim().slice(0, 160) : "";
+}
+
+function isActiveGenerationStatus(status: GenerationStatus): boolean {
+  return status === "pending" || status === "submitted";
+}
+
+function matchesStatusFilter(job: GenerationJob, status?: GenerationJobStatusFilter): boolean {
+  if (!status) {
+    return true;
+  }
+
+  if (status === "active") {
+    return isActiveGenerationStatus(job.status);
+  }
+
+  if (status === "terminal") {
+    return job.status === "completed" || job.status === "failed";
+  }
+
+  return job.status === status;
+}
+
+function matchesGenerationJobFilters(
+  job: GenerationJob,
+  filters: Pick<GenerationJobListOptions, "mode" | "query" | "status">
+): boolean {
+  const query = normalizeSearchQuery(filters.query).toLowerCase();
+
+  return (
+    (!query || job.prompt.toLowerCase().includes(query)) &&
+    (!filters.mode || job.mode === filters.mode) &&
+    matchesStatusFilter(job, filters.status)
+  );
+}
+
+function filterGenerationJobs(
+  jobs: GenerationJob[],
+  filters: Pick<GenerationJobListOptions, "mode" | "query" | "status">
+): GenerationJob[] {
+  return jobs.filter((job) => matchesGenerationJobFilters(job, filters));
+}
+
+function uniqueIds(ids: string[] | undefined): string[] {
+  return [...new Set((ids ?? []).filter((id) => typeof id === "string" && id.length > 0))];
+}
+
+function shouldDeleteJobByScope(job: GenerationJob, scope: DeleteGenerationJobsScope): boolean {
+  if (scope === "all") {
+    return true;
+  }
+
+  return job.status === scope;
+}
+
+function buildDeleteResult(input: {
+  deletedCount: number;
+  notFoundIds?: string[];
+  skippedActive?: number;
+}): DeleteGenerationJobsResult {
+  return {
+    deletedCount: input.deletedCount,
+    notFoundIds: input.notFoundIds ?? [],
+    skippedActive: input.skippedActive ?? 0
+  };
 }
 
 function getPostgresPool(): Pool {
@@ -263,8 +359,16 @@ async function ensurePostgresSchema(): Promise<void> {
       ON generation_jobs (created_at DESC)
     `);
     await pool.query(`
+      CREATE INDEX IF NOT EXISTS generation_jobs_created_at_id_idx
+      ON generation_jobs (created_at DESC, id DESC)
+    `);
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS generation_jobs_active_idx
       ON generation_jobs (status, created_at DESC)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS generation_jobs_status_mode_created_at_idx
+      ON generation_jobs (status, mode, created_at DESC)
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS generation_jobs_dragon_task_id_idx
@@ -431,17 +535,53 @@ async function listPostgresGenerationJobs(): Promise<GenerationJob[]> {
 async function listPostgresGenerationJobsPage(options: {
   page?: number;
   pageSize?: number;
+  query?: string;
+  status?: GenerationJobStatusFilter;
+  mode?: GenerationMode;
 } = {}): Promise<GenerationJobsPage> {
   await ensurePostgresSchema();
   const pageSize = Math.max(1, Math.floor(options.pageSize ?? 10));
-  const countResult = await getPostgresPool().query("SELECT COUNT(*) AS total FROM generation_jobs");
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const query = normalizeSearchQuery(options.query);
+
+  if (query) {
+    params.push(`%${query.toLowerCase()}%`);
+    clauses.push(`LOWER(prompt) LIKE $${params.length}`);
+  }
+
+  if (options.status === "active") {
+    clauses.push("status IN ('pending', 'submitted')");
+  } else if (options.status === "terminal") {
+    clauses.push("status IN ('completed', 'failed')");
+  } else if (options.status) {
+    params.push(options.status);
+    clauses.push(`status = $${params.length}`);
+  }
+
+  if (options.mode) {
+    params.push(options.mode);
+    clauses.push(`mode = $${params.length}`);
+  }
+
+  const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  const countResult = await getPostgresPool().query(
+    `SELECT COUNT(*) AS total FROM generation_jobs ${whereSql}`,
+    params
+  );
   const total = Number(countResult.rows[0]?.total ?? 0);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(Math.max(1, Math.floor(options.page ?? 1)), totalPages);
   const offset = (page - 1) * pageSize;
   const result = await getPostgresPool().query(
-    "SELECT * FROM generation_jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-    [pageSize, offset]
+    `
+      SELECT *
+      FROM generation_jobs
+      ${whereSql}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `,
+    [...params, pageSize, offset]
   );
 
   return {
@@ -487,6 +627,97 @@ async function getPostgresGenerationJobByClientRequestId(
   );
 
   return result.rows[0] ? rowToGenerationJob(result.rows[0]) : null;
+}
+
+async function listPostgresGenerationJobsByIds(ids: string[]): Promise<GenerationJob[]> {
+  await ensurePostgresSchema();
+  const normalizedIds = uniqueIds(ids);
+
+  if (normalizedIds.length === 0) {
+    return [];
+  }
+
+  const placeholders = normalizedIds.map((_id, index) => `$${index + 1}`).join(", ");
+  const result = await getPostgresPool().query(
+    `
+      SELECT *
+      FROM generation_jobs
+      WHERE id IN (${placeholders})
+      ORDER BY created_at DESC, id DESC
+    `,
+    normalizedIds
+  );
+
+  return result.rows.map(rowToGenerationJob);
+}
+
+async function deletePostgresGenerationJobs(
+  options: DeleteGenerationJobsOptions
+): Promise<DeleteGenerationJobsResult> {
+  await ensurePostgresSchema();
+  const ids = uniqueIds(options.ids);
+
+  if (ids.length > 0) {
+    const existing = await listPostgresGenerationJobsByIds(ids);
+    const existingIds = new Set(existing.map((job) => job.id));
+    const notFoundIds = ids.filter((id) => !existingIds.has(id));
+    const deletable = existing.filter(
+      (job) => options.includeActive || !isActiveGenerationStatus(job.status)
+    );
+    const skippedActive = existing.length - deletable.length;
+
+    if (deletable.length > 0) {
+      const placeholders = deletable.map((_job, index) => `$${index + 1}`).join(", ");
+
+      await getPostgresPool().query(
+        `DELETE FROM generation_jobs WHERE id IN (${placeholders})`,
+        deletable.map((job) => job.id)
+      );
+    }
+
+    return buildDeleteResult({
+      deletedCount: deletable.length,
+      notFoundIds,
+      skippedActive
+    });
+  }
+
+  if (!options.scope) {
+    return buildDeleteResult({ deletedCount: 0 });
+  }
+
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.scope !== "all") {
+    params.push(options.scope);
+    clauses.push(`status = $${params.length}`);
+  }
+
+  if (!options.includeActive) {
+    clauses.push("status NOT IN ('pending', 'submitted')");
+  }
+
+  const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  let skippedActive = 0;
+
+  if (options.scope === "all" && !options.includeActive) {
+    const skippedResult = await getPostgresPool().query(
+      "SELECT COUNT(*) AS total FROM generation_jobs WHERE status IN ('pending', 'submitted')"
+    );
+
+    skippedActive = Number(skippedResult.rows[0]?.total ?? 0);
+  }
+
+  const result = await getPostgresPool().query(
+    `DELETE FROM generation_jobs ${whereSql}`,
+    params
+  );
+
+  return buildDeleteResult({
+    deletedCount: result.rowCount ?? 0,
+    skippedActive
+  });
 }
 
 async function createPostgresGenerationJob(input: NewGenerationJob): Promise<GenerationJob> {
@@ -664,16 +895,13 @@ export async function listGenerationJobs(databasePath?: string): Promise<Generat
 
 export async function listGenerationJobsPage(
   databasePath?: string,
-  options: {
-    page?: number;
-    pageSize?: number;
-  } = {}
+  options: GenerationJobListOptions = {}
 ): Promise<GenerationJobsPage> {
   if (shouldUsePostgres(databasePath)) {
     return listPostgresGenerationJobsPage(options);
   }
 
-  const jobs = await listGenerationJobs(databasePath);
+  const jobs = filterGenerationJobs(await listGenerationJobs(databasePath), options);
   const pageSize = Math.max(1, Math.floor(options.pageSize ?? 10));
   const total = jobs.length;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -687,6 +915,23 @@ export async function listGenerationJobsPage(
     total,
     totalPages
   };
+}
+
+export async function listGenerationJobsByIds(
+  ids: string[],
+  databasePath?: string
+): Promise<GenerationJob[]> {
+  if (shouldUsePostgres(databasePath)) {
+    return listPostgresGenerationJobsByIds(ids);
+  }
+
+  const idSet = new Set(uniqueIds(ids));
+
+  if (idSet.size === 0) {
+    return [];
+  }
+
+  return (await listGenerationJobs(databasePath)).filter((job) => idSet.has(job.id));
 }
 
 export async function listActiveGenerationJobs(databasePath?: string): Promise<GenerationJob[]> {
@@ -843,6 +1088,60 @@ export async function deleteGenerationJob(id: string, databasePath?: string): Pr
     await writeStore({ ...data, jobs: remainingJobs }, resolvedPath);
 
     return true;
+  });
+}
+
+export async function deleteGenerationJobs(
+  options: DeleteGenerationJobsOptions,
+  databasePath?: string
+): Promise<DeleteGenerationJobsResult> {
+  if (shouldUsePostgres(databasePath)) {
+    return deletePostgresGenerationJobs(options);
+  }
+
+  const resolvedPath = resolveDatabasePath(databasePath);
+
+  return withStoreWriteLock(resolvedPath, async () => {
+    const data = await readStore(resolvedPath);
+    const ids = uniqueIds(options.ids);
+    const idSet = new Set(ids);
+    const existing = ids.length > 0 ? data.jobs.filter((job) => idSet.has(job.id)) : data.jobs;
+    const existingIds = new Set(existing.map((job) => job.id));
+    const notFoundIds = ids.length > 0 ? ids.filter((id) => !existingIds.has(id)) : [];
+    const candidates =
+      ids.length > 0
+        ? existing
+        : options.scope
+          ? existing.filter((job) => shouldDeleteJobByScope(job, options.scope as DeleteGenerationJobsScope))
+          : [];
+    const deletable = candidates.filter(
+      (job) => options.includeActive || !isActiveGenerationStatus(job.status)
+    );
+    const skippedActive = candidates.length - deletable.length;
+
+    if (deletable.length === 0) {
+      return buildDeleteResult({
+        deletedCount: 0,
+        notFoundIds,
+        skippedActive
+      });
+    }
+
+    const deleteIds = new Set(deletable.map((job) => job.id));
+
+    await writeStore(
+      {
+        ...data,
+        jobs: data.jobs.filter((job) => !deleteIds.has(job.id))
+      },
+      resolvedPath
+    );
+
+    return buildDeleteResult({
+      deletedCount: deletable.length,
+      notFoundIds,
+      skippedActive
+    });
   });
 }
 

@@ -712,6 +712,38 @@ a:focus-visible {
   gap: var(--space-sm);
 }
 
+.mobile-quick-nav {
+  position: sticky;
+  top: var(--space-sm);
+  z-index: 4;
+  display: none;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-xs);
+  max-width: 1680px;
+  margin: 0 auto var(--space-sm);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: oklch(1 0.012 98 / 0.9);
+  padding: var(--space-xs);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow-sm);
+}
+
+.mobile-quick-nav a {
+  min-height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.88rem;
+  font-weight: 850;
+  text-decoration: none;
+}
+
+.mobile-quick-nav a:active {
+  background: var(--accent-soft);
+}
+
 .user-chip,
 .count-chip,
 .status-pill {
@@ -907,6 +939,37 @@ a:focus-visible {
 .upload-actions small {
   color: var(--soft);
   font-size: 0.86rem;
+}
+
+.batch-row {
+  display: grid;
+  gap: var(--space-xs);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: oklch(1 0.012 98 / 0.56);
+  padding: var(--space-sm);
+}
+
+.batch-row small {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.checkbox-line {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--text-strong);
+  font-weight: 850;
+}
+
+.checkbox-line input,
+.history-select input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--accent-strong);
 }
 
 .visually-hidden-input {
@@ -1115,7 +1178,35 @@ a:focus-visible {
   max-height: calc(100vh - 132px);
   overflow: hidden;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.history-tools {
+  display: grid;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.history-filter-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-xs);
+}
+
+.history-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+.history-bulk-actions .secondary-button {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+
+.danger-action {
+  border-color: oklch(0.52 0.16 28 / 0.32);
+  color: var(--danger);
 }
 
 .history-list {
@@ -1169,7 +1260,7 @@ a:focus-visible {
 .history-item {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 36px;
+  grid-template-columns: 28px minmax(0, 1fr) 44px;
   gap: var(--space-xs);
   align-items: center;
   border: 1px solid var(--line);
@@ -1183,6 +1274,15 @@ a:focus-visible {
     border-color 160ms var(--ease-out-quint),
     background-color 160ms var(--ease-out-quint),
     box-shadow 160ms var(--ease-out-quint);
+  content-visibility: auto;
+  contain-intrinsic-size: 78px;
+}
+
+.history-select {
+  min-height: 44px;
+  display: grid;
+  place-items: center;
+  padding: 0;
 }
 
 .history-item:hover {
@@ -1245,8 +1345,8 @@ a:focus-visible {
 }
 
 .history-delete {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   display: grid;
   place-items: center;
   border: 1px solid transparent;
@@ -1345,6 +1445,10 @@ a:focus-visible {
     padding: var(--space-md);
   }
 
+  .mobile-quick-nav {
+    display: grid;
+  }
+
   .studio-shell::before {
     background-size:
       96px auto,
@@ -1422,6 +1526,14 @@ a:focus-visible {
   .history-thumb {
     width: 54px;
     height: 54px;
+  }
+
+  .history-filter-row {
+    grid-template-columns: 1fr;
+  }
+
+  .history-bulk-actions .secondary-button {
+    flex: 1 1 calc(50% - var(--space-xs));
   }
 }
 

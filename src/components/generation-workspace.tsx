@@ -1,7 +1,21 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  FormEvent,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { useRouter } from "next/navigation";
+import {
+  BATCH_PROMPT_LIMIT,
+  buildBatchPromptValidation,
+  createGenerationFingerprint
+} from "@/lib/batch-generation";
 import { IMAGE_INPUT_LIMITS, validateClientImageFiles } from "@/lib/client-upload-validation";
 import { groupJobsByLocalDay } from "@/lib/history-groups";
 import {
@@ -54,9 +68,19 @@ type HistoryPagination = {
   totalPages: number;
 };
 
+type HistoryStatusFilter = "all" | "active" | "completed" | "failed";
+type HistoryModeFilter = "all" | GenerationMode;
+type BulkDeleteScope = "all" | "completed" | "failed";
+type HistoryFilters = {
+  mode: HistoryModeFilter;
+  query: string;
+  status: HistoryStatusFilter;
+};
+
 const terminalStatuses = new Set(["completed", "failed"]);
 const activeStatuses = new Set(["queued", "submitted", "pending", "running", "processing"]);
-const HISTORY_PAGE_SIZE = 5;
+const HISTORY_PAGE_SIZE = 8;
+const BATCH_SUBMIT_DELAY_MS = 600;
 const statusText: Record<string, string> = {
   queued: "排队中",
   submitted: "已提交",
@@ -67,35 +91,14 @@ const statusText: Record<string, string> = {
   failed: "失败"
 };
 const AMBIGUOUS_SUBMISSION_MESSAGE = "请求可能已提交，请先刷新历史记录确认，避免重复提交。";
-
-type PendingSubmission = {
-  fingerprint: string;
-  clientRequestId: string;
+const defaultHistoryFilters: HistoryFilters = {
+  mode: "all",
+  query: "",
+  status: "all"
 };
 
 function createClientRequestId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function createSubmissionFingerprint(input: {
-  files: File[];
-  mode: GenerationMode;
-  prompt: string;
-  resolution: ImageResolution;
-  size: ImageSize;
-}): string {
-  return JSON.stringify({
-    files: input.files.map((file) => ({
-      lastModified: file.lastModified,
-      name: file.name,
-      size: file.size,
-      type: file.type
-    })),
-    mode: input.mode,
-    prompt: input.prompt.trim(),
-    resolution: input.resolution,
-    size: input.size
-  });
 }
 
 function extractImageUrls(job?: GenerationJob | null): string[] {
@@ -157,13 +160,26 @@ function modeLabel(mode?: string) {
   return mode === "image" ? "图 + 文" : "文生图";
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function historyFilterKey(filters: HistoryFilters): string {
+  return `${filters.query}::${filters.status}::${filters.mode}`;
+}
+
 export function GenerationWorkspace() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const submitInFlightRef = useRef(false);
-  const pendingSubmissionRef = useRef<PendingSubmission | null>(null);
+  const pendingSubmissionIdsRef = useRef(new Map<string, string>());
+  const historyFiltersRef = useRef<HistoryFilters>(defaultHistoryFilters);
+  const historyRequestIdRef = useRef(0);
+  const hasLoadedHistoryRef = useRef(false);
+  const lastLoadedFilterKeyRef = useRef("");
   const [username, setUsername] = useState("");
   const [mode, setMode] = useState<GenerationMode>("text");
+  const [isBatchMode, setIsBatchMode] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [resolution, setResolution] = useState<ImageResolution>("2k");
   const [size, setSize] = useState<ImageSize>("1:1");
@@ -180,35 +196,69 @@ export function GenerationWorkspace() {
   const [isHistoryPageLoading, setIsHistoryPageLoading] = useState(false);
   const [loadingHistoryPage, setLoadingHistoryPage] = useState<number | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ completed: number; total: number } | null>(null);
   const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
+  const deferredHistorySearch = useDeferredValue(historySearch);
+  const [historyStatusFilter, setHistoryStatusFilter] = useState<HistoryStatusFilter>("all");
+  const [historyModeFilter, setHistoryModeFilter] = useState<HistoryModeFilter>("all");
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(() => new Set());
   const [message, setMessage] = useState("");
 
   const supportedSizes = useMemo(() => supportedSizesForResolution(resolution), [resolution]);
   const historyGroups = useMemo(() => groupJobsByLocalDay(jobs), [jobs]);
+  const promptValidation = useMemo(
+    () => buildBatchPromptValidation(prompt, isBatchMode),
+    [isBatchMode, prompt]
+  );
   const activeImages = extractImageUrls(activeJob);
   const isActiveJobGenerating = Boolean(
     activeJob?.status && activeStatuses.has(String(activeJob.status)) && !terminalStatuses.has(String(activeJob.status))
   );
+  const visibleActiveJobIds = useMemo(
+    () =>
+      jobs
+        .filter((job) => job.status && activeStatuses.has(String(job.status)) && !terminalStatuses.has(String(job.status)))
+        .map((job) => job.id),
+    [jobs]
+  );
+  const visibleActiveJobKey = visibleActiveJobIds.join(",");
   const hasActiveGeneration = Boolean(
     isActiveJobGenerating ||
       jobs.some((job) => job.status && activeStatuses.has(String(job.status)) && !terminalStatuses.has(String(job.status)))
   );
+  const activeGenerationCount = visibleActiveJobIds.length + (isActiveJobGenerating && !visibleActiveJobIds.includes(activeJob?.id ?? "") ? 1 : 0);
   const fileValidationError = mode === "image" ? validateClientImageFiles(files) : null;
   const canSubmit =
-    prompt.trim().length > 0 &&
+    promptValidation.prompts.length > 0 &&
+    !promptValidation.error &&
     !isSubmitting &&
-    !hasActiveGeneration &&
     !fileValidationError &&
     (mode !== "image" || files.length > 0) &&
     isSupportedImageOption({ resolution, size });
 
-  const loadHistoryPage = useCallback(async (page: number, options?: { selectFirst?: boolean }) => {
+  const loadHistoryPage = useCallback(async (page: number, options?: { filters?: HistoryFilters; selectFirst?: boolean }) => {
+    const requestId = historyRequestIdRef.current + 1;
+    const filters = options?.filters ?? historyFiltersRef.current;
+
+    historyRequestIdRef.current = requestId;
     setIsHistoryPageLoading(true);
     setLoadingHistoryPage(page);
     const params = new URLSearchParams({
       page: String(page),
       pageSize: String(HISTORY_PAGE_SIZE)
     });
+
+    if (filters.query) {
+      params.set("q", filters.query);
+    }
+    if (filters.status !== "all") {
+      params.set("status", filters.status);
+    }
+    if (filters.mode !== "all") {
+      params.set("mode", filters.mode);
+    }
 
     try {
       const jobsResponse = await fetch(`/api/generations?${params.toString()}`, { cache: "no-store" });
@@ -228,8 +278,18 @@ export function GenerationWorkspace() {
         totalPages: 1
       };
 
+      if (requestId !== historyRequestIdRef.current) {
+        return;
+      }
+
       setJobs(loadedJobs);
       setHistoryPagination(pagination);
+      setSelectedJobIds((current) => {
+        const visibleIds = new Set(loadedJobs.map((job) => job.id));
+        const next = new Set([...current].filter((id) => visibleIds.has(id)));
+
+        return next.size === current.size ? current : next;
+      });
       setActiveJob((currentJob) => {
         if (options?.selectFirst) {
           return loadedJobs[0] ?? null;
@@ -237,9 +297,13 @@ export function GenerationWorkspace() {
 
         return loadedJobs.find((job) => job.id === currentJob?.id) ?? currentJob;
       });
+      hasLoadedHistoryRef.current = true;
+      lastLoadedFilterKeyRef.current = historyFilterKey(filters);
     } finally {
-      setIsHistoryPageLoading(false);
-      setLoadingHistoryPage(null);
+      if (requestId === historyRequestIdRef.current) {
+        setIsHistoryPageLoading(false);
+        setLoadingHistoryPage(null);
+      }
     }
   }, []);
 
@@ -289,49 +353,72 @@ export function GenerationWorkspace() {
   }, [loadHistoryPage, router]);
 
   useEffect(() => {
-    if (!activeJob?.id || terminalStatuses.has(String(activeJob.status))) {
+    const filters: HistoryFilters = {
+      mode: historyModeFilter,
+      query: deferredHistorySearch.trim(),
+      status: historyStatusFilter
+    };
+    const nextFilterKey = historyFilterKey(filters);
+
+    historyFiltersRef.current = filters;
+    if (!hasLoadedHistoryRef.current || isLoading || lastLoadedFilterKeyRef.current === nextFilterKey) {
       return;
     }
 
-    const interval = window.setInterval(async () => {
+    setMessage("");
+    void loadHistoryPage(1, { filters, selectFirst: true }).catch((error) => {
+      setMessage(error instanceof Error ? error.message : "无法加载生成历史。");
+    });
+  }, [
+    deferredHistorySearch,
+    historyModeFilter,
+    historyStatusFilter,
+    isLoading,
+    loadHistoryPage
+  ]);
+
+  useEffect(() => {
+    if (!visibleActiveJobKey) {
+      return;
+    }
+
+    const refreshVisibleActiveJobs = async () => {
       try {
-        const response = await fetch(`/api/generations/${activeJob.id}`, { cache: "no-store" });
+        const response = await fetch(
+          `/api/generations/status?ids=${encodeURIComponent(visibleActiveJobKey)}`,
+          { cache: "no-store" }
+        );
         if (!response.ok) {
           return;
         }
 
-        const payload = (await response.json()) as { job?: GenerationJob; warning?: string };
-        if (!payload.job) {
+        const payload = (await response.json()) as { jobs?: GenerationJob[] };
+        const refreshedJobs = payload.jobs ?? [];
+        if (refreshedJobs.length === 0) {
           return;
         }
 
-        setActiveJob(payload.job);
-        setMessage((currentMessage) => {
-          if (payload.warning) {
-            return payload.warning;
-          }
-
-          return currentMessage.startsWith("DragonCode 任务查询暂时失败") ? "" : currentMessage;
-        });
+        const byId = new Map(refreshedJobs.map((job) => [job.id, job]));
         setJobs((currentJobs) => {
-          const exists = currentJobs.some((job) => job.id === payload.job?.id);
-          if (!exists) {
-            return [payload.job as GenerationJob, ...currentJobs];
-          }
-
-          return currentJobs.map((job) => (job.id === payload.job?.id ? (payload.job as GenerationJob) : job));
+          return currentJobs.map((job) => byId.get(job.id) ?? job);
         });
+        setActiveJob((currentJob) =>
+          currentJob?.id ? byId.get(currentJob.id) ?? currentJob : currentJob
+        );
       } catch {
-        // 下一轮轮询会继续尝试。
+        // 下一轮会继续尝试，避免用短暂网络抖动打扰用户。
       }
-    }, 2500);
+    };
+
+    void refreshVisibleActiveJobs();
+    const interval = window.setInterval(refreshVisibleActiveJobs, 3500);
 
     return () => window.clearInterval(interval);
-  }, [activeJob?.id, activeJob?.status]);
+  }, [visibleActiveJobKey]);
 
   function clearSelectedFiles() {
     setFiles([]);
-    pendingSubmissionRef.current = null;
+    pendingSubmissionIdsRef.current.clear();
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -350,7 +437,7 @@ export function GenerationWorkspace() {
     const nextFiles = Array.from(event.target.files ?? []);
     const validationError = validateClientImageFiles(nextFiles);
 
-    pendingSubmissionRef.current = null;
+    pendingSubmissionIdsRef.current.clear();
 
     if (validationError) {
       setFiles([]);
@@ -363,17 +450,26 @@ export function GenerationWorkspace() {
     setMessage("");
   }
 
+  function getClientRequestIdForFingerprint(fingerprint: string): string {
+    const existing = pendingSubmissionIdsRef.current.get(fingerprint);
+
+    if (existing) {
+      return existing;
+    }
+
+    const clientRequestId = createClientRequestId();
+
+    pendingSubmissionIdsRef.current.set(fingerprint, clientRequestId);
+
+    return clientRequestId;
+  }
+
   async function handleGenerate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setMessage("");
 
-    if (hasActiveGeneration) {
-      setMessage("当前已有任务生成中，请等待完成后再提交。");
-      return;
-    }
-
     if (!canSubmit) {
-      setMessage("请先选择支持的分辨率和画幅比例。");
+      setMessage(promptValidation.error ?? fileValidationError ?? "请先选择支持的分辨率和画幅比例。");
       return;
     }
 
@@ -393,81 +489,80 @@ export function GenerationWorkspace() {
 
     submitInFlightRef.current = true;
     setIsSubmitting(true);
-
-    const formData = new FormData();
+    setBatchProgress({ completed: 0, total: promptValidation.prompts.length });
     const filesForSubmission = mode === "image" ? files : [];
-    const submissionFingerprint = createSubmissionFingerprint({
-      files: filesForSubmission,
-      mode,
-      prompt,
-      resolution,
-      size
-    });
-    const reusableSubmission = pendingSubmissionRef.current;
-    const clientRequestId =
-      reusableSubmission?.fingerprint === submissionFingerprint
-        ? reusableSubmission.clientRequestId
-        : createClientRequestId();
-
-    pendingSubmissionRef.current = {
-      fingerprint: submissionFingerprint,
-      clientRequestId
-    };
-    formData.set("prompt", prompt.trim());
-    formData.set("resolution", resolution);
-    formData.set("size", size);
-    formData.set("mode", mode);
-    formData.set("clientRequestId", clientRequestId);
-    filesForSubmission.forEach((file) => formData.append("images", file));
+    let submittedCount = 0;
+    let firstError = "";
 
     try {
-      const response = await fetch("/api/generations", {
-        method: "POST",
-        body: formData
-      });
-
-      const payload = (await response.json().catch(() => ({}))) as {
-        job?: GenerationJob;
-        error?: string;
-      };
-
-      if (!response.ok) {
-        setMessage(payload.error ?? AMBIGUOUS_SUBMISSION_MESSAGE);
-        return;
-      }
-
-      if (!payload.job) {
-        await loadHistoryPage(1, { selectFirst: true }).catch(() => undefined);
-        setMessage(AMBIGUOUS_SUBMISSION_MESSAGE);
-        return;
-      }
-
-      pendingSubmissionRef.current = null;
-      setActiveJob(payload.job);
-      if (response.status === 201) {
-        setHistoryPagination((current) => {
-          const total = current.total + 1;
-
-          return {
-            ...current,
-            page: 1,
-            total,
-            totalPages: Math.max(1, Math.ceil(total / current.pageSize))
-          };
+      for (const [index, promptText] of promptValidation.prompts.entries()) {
+        const formData = new FormData();
+        const submissionFingerprint = createGenerationFingerprint({
+          files: filesForSubmission,
+          mode,
+          prompt: promptText,
+          resolution,
+          size
         });
+        const clientRequestId = getClientRequestIdForFingerprint(submissionFingerprint);
+
+        formData.set("prompt", promptText);
+        formData.set("resolution", resolution);
+        formData.set("size", size);
+        formData.set("mode", mode);
+        formData.set("clientRequestId", clientRequestId);
+        filesForSubmission.forEach((file) => formData.append("images", file));
+
+        const response = await fetch("/api/generations", {
+          method: "POST",
+          body: formData
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          job?: GenerationJob;
+          error?: string;
+        };
+
+        if (payload.job) {
+          setActiveJob(payload.job);
+          setJobs((currentJobs) =>
+            [payload.job as GenerationJob, ...currentJobs.filter((job) => job.id !== payload.job?.id)].slice(
+              0,
+              HISTORY_PAGE_SIZE
+            )
+          );
+        }
+
+        if (!response.ok || !payload.job) {
+          firstError = `第 ${index + 1} 条提交失败：${payload.error ?? AMBIGUOUS_SUBMISSION_MESSAGE}`;
+          break;
+        }
+
+        pendingSubmissionIdsRef.current.delete(submissionFingerprint);
+        submittedCount += 1;
+        setBatchProgress({ completed: submittedCount, total: promptValidation.prompts.length });
+
+        if (index < promptValidation.prompts.length - 1) {
+          await delay(BATCH_SUBMIT_DELAY_MS);
+        }
       }
-      setJobs((currentJobs) =>
-        [payload.job as GenerationJob, ...currentJobs.filter((job) => job.id !== payload.job?.id)].slice(
-          0,
-          HISTORY_PAGE_SIZE
-        )
-      );
+
+      await loadHistoryPage(1, { selectFirst: true }).catch(() => undefined);
+      if (firstError) {
+        setMessage(
+          submittedCount > 0
+            ? `已提交 ${submittedCount}/${promptValidation.prompts.length} 个任务，${firstError}`
+            : firstError
+        );
+      } else if (isBatchMode) {
+        setMessage(`已提交 ${submittedCount} 个任务，结果会自动刷新。`);
+      }
     } catch {
       await loadHistoryPage(1, { selectFirst: true }).catch(() => undefined);
       setMessage(AMBIGUOUS_SUBMISSION_MESSAGE);
     } finally {
       submitInFlightRef.current = false;
       setIsSubmitting(false);
+      setBatchProgress(null);
     }
   }
 
@@ -523,6 +618,91 @@ export function GenerationWorkspace() {
     }
   }
 
+  function toggleJobSelection(jobId: string) {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+
+      if (next.has(jobId)) {
+        next.delete(jobId);
+      } else {
+        next.add(jobId);
+      }
+
+      return next;
+    });
+  }
+
+  function toggleVisibleSelection() {
+    setSelectedJobIds((current) => {
+      const visibleIds = jobs.map((job) => job.id);
+      const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => current.has(id));
+      const next = new Set(current);
+
+      for (const id of visibleIds) {
+        if (allVisibleSelected) {
+          next.delete(id);
+        } else {
+          next.add(id);
+        }
+      }
+
+      return next;
+    });
+  }
+
+  async function handleBulkDelete(input: {
+    ids?: string[];
+    scope?: BulkDeleteScope;
+    title: string;
+  }) {
+    const targetCount = input.ids?.length ?? historyPagination.total;
+    const confirmed = window.confirm(
+      `${input.title}？生成中的任务会自动保留。预计影响 ${targetCount} 条以内的历史记录。`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsBulkDeleting(true);
+    setMessage("");
+
+    try {
+      const response = await fetch("/api/generations/delete", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ids: input.ids,
+          scope: input.scope
+        })
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        deletedCount?: number;
+        error?: string;
+        skippedActive?: number;
+      };
+
+      if (!response.ok) {
+        setMessage(payload.error ?? "删除失败，请稍后重试。");
+        return;
+      }
+
+      setSelectedJobIds(new Set());
+      await loadHistoryPage(1, { selectFirst: true });
+      setMessage(
+        `已删除 ${payload.deletedCount ?? 0} 条历史${
+          payload.skippedActive ? `，保留 ${payload.skippedActive} 条生成中任务` : ""
+        }。`
+      );
+    } catch {
+      setMessage("删除请求失败，请稍后重试。");
+    } finally {
+      setIsBulkDeleting(false);
+    }
+  }
+
   async function handleHistoryPageChange(page: number) {
     if (
       page < 1 ||
@@ -570,12 +750,18 @@ export function GenerationWorkspace() {
           </div>
         </div>
         <div className="header-actions">
+          {activeGenerationCount > 0 ? <span className="status-pill status-pending">{activeGenerationCount} 个生成中</span> : null}
           <span className="user-chip">{username || "..."}</span>
           <button className="secondary-button" onClick={handleLogout} type="button">
             退出登录
           </button>
         </div>
       </header>
+      <nav className="mobile-quick-nav" aria-label="工作台快捷导航">
+        <a href="#composer-title">创作</a>
+        <a href="#result-title">结果</a>
+        <a href="#history-title">历史</a>
+      </nav>
 
       <div className="workspace-grid">
         <section className="panel composer-panel" aria-labelledby="composer-title">
@@ -616,6 +802,21 @@ export function GenerationWorkspace() {
                 value={prompt}
               />
             </label>
+            <div className="batch-row">
+              <label className="checkbox-line">
+                <input
+                  checked={isBatchMode}
+                  onChange={(event) => setIsBatchMode(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>批量生成</span>
+              </label>
+              <small>
+                {isBatchMode
+                  ? `一行一张，最多 ${BATCH_PROMPT_LIMIT} 条；参考图会应用到每条任务。`
+                  : "开启后可一次提交多条提示词，系统会按稳妥节奏排队提交。"}
+              </small>
+            </div>
 
             <div className="control-row">
               <label>
@@ -687,11 +888,20 @@ export function GenerationWorkspace() {
             {resolution === "4k" ? (
               <p className="hint">4k 仅支持宽屏或竖屏比例，不兼容的比例已自动禁用。</p>
             ) : null}
+            {hasActiveGeneration ? (
+              <p className="hint">当前有任务生成中，新任务会受控提交并自动刷新结果。</p>
+            ) : null}
 
             {message ? <p className="form-error">{message}</p> : null}
 
             <button className="primary-button" disabled={!canSubmit} type="submit">
-              {isSubmitting ? "正在提交..." : "开始生成"}
+              {isSubmitting
+                ? batchProgress
+                  ? `正在提交 ${batchProgress.completed}/${batchProgress.total}`
+                  : "正在提交..."
+                : isBatchMode
+                  ? `批量生成 ${promptValidation.prompts.length || ""}`
+                  : "开始生成"}
             </button>
           </form>
         </section>
@@ -766,6 +976,89 @@ export function GenerationWorkspace() {
             </div>
             <span className="count-chip">{historyPagination.total}</span>
           </div>
+          <div className="history-tools" aria-label="历史筛选与批量操作">
+            <label className="history-search">
+              <span>搜索</span>
+              <input
+                onChange={(event) => setHistorySearch(event.target.value)}
+                placeholder="按提示词搜索"
+                type="search"
+                value={historySearch}
+              />
+            </label>
+            <div className="history-filter-row">
+              <label>
+                <span>状态</span>
+                <select
+                  onChange={(event) => setHistoryStatusFilter(event.target.value as HistoryStatusFilter)}
+                  value={historyStatusFilter}
+                >
+                  <option value="all">全部状态</option>
+                  <option value="active">生成中</option>
+                  <option value="completed">已完成</option>
+                  <option value="failed">失败</option>
+                </select>
+              </label>
+              <label>
+                <span>模式</span>
+                <select
+                  onChange={(event) => setHistoryModeFilter(event.target.value as HistoryModeFilter)}
+                  value={historyModeFilter}
+                >
+                  <option value="all">全部模式</option>
+                  <option value="text">文生图</option>
+                  <option value="image">图 + 文</option>
+                </select>
+              </label>
+            </div>
+            <div className="history-bulk-actions">
+              <button
+                className="secondary-button"
+                disabled={jobs.length === 0 || isBulkDeleting}
+                onClick={toggleVisibleSelection}
+                type="button"
+              >
+                {jobs.length > 0 && jobs.every((job) => selectedJobIds.has(job.id)) ? "取消全选" : "全选本页"}
+              </button>
+              <button
+                className="secondary-button"
+                disabled={selectedJobIds.size === 0 || isBulkDeleting}
+                onClick={() =>
+                  void handleBulkDelete({
+                    ids: [...selectedJobIds],
+                    title: `删除选中的 ${selectedJobIds.size} 条历史`
+                  })
+                }
+                type="button"
+              >
+                删除选中
+              </button>
+              <button
+                className="secondary-button"
+                disabled={isBulkDeleting}
+                onClick={() => void handleBulkDelete({ scope: "failed", title: "清空失败历史" })}
+                type="button"
+              >
+                清空失败
+              </button>
+              <button
+                className="secondary-button"
+                disabled={isBulkDeleting}
+                onClick={() => void handleBulkDelete({ scope: "completed", title: "清空已完成历史" })}
+                type="button"
+              >
+                清空已完成
+              </button>
+              <button
+                className="secondary-button danger-action"
+                disabled={isBulkDeleting}
+                onClick={() => void handleBulkDelete({ scope: "all", title: "一键清空非生成中历史" })}
+                type="button"
+              >
+                一键清空
+              </button>
+            </div>
+          </div>
 
           {isLoading ? (
             <div className="empty-state">正在加载历史...</div>
@@ -790,6 +1083,14 @@ export function GenerationWorkspace() {
                           className={activeJob?.id === job.id ? "history-item selected" : "history-item"}
                           key={job.id}
                         >
+                          <label className="history-select">
+                            <input
+                              aria-label={`选择 ${job.prompt || "未命名生成"}`}
+                              checked={selectedJobIds.has(job.id)}
+                              onChange={() => toggleJobSelection(job.id)}
+                              type="checkbox"
+                            />
+                          </label>
                           <button className="history-open" onClick={() => setActiveJob(job)} type="button">
                             <span className="history-thumb">
                               {imageUrl ? (

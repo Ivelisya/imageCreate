@@ -13,8 +13,10 @@ import {
   submitDragonGeneration
 } from "@/lib/dragon-client";
 import { resetGenerationPollingForTests } from "@/lib/generation-poller";
-import { POST } from "./route";
+import { GET, POST } from "./route";
 import { GET as GET_GENERATION } from "./[id]/route";
+import { POST as BULK_DELETE } from "./delete/route";
+import { GET as GET_STATUS } from "./status/route";
 
 vi.mock("@/lib/dragon-client", () => ({
   fetchDragonTask: vi.fn(),
@@ -66,6 +68,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   resetGenerationPollingForTests();
+  vi.useRealTimers();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   delete process.env.DATABASE_PATH;
   delete process.env.DRAGON_API_KEY;
@@ -139,6 +142,44 @@ describe("generation API routes", () => {
     expect(await listGenerationJobs()).toHaveLength(1);
   });
 
+  it("reclaims stale idempotent reservations that never received a DragonCode task id", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-29T00:00:00.000Z"));
+    const stale = await createGenerationJob({
+      clientRequestId: "stale-reservation",
+      dragonTaskId: null,
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "make a poster",
+      resolution: "2k",
+      size: "1:1",
+      status: "pending"
+    });
+    vi.setSystemTime(new Date("2026-04-29T00:03:00.000Z"));
+    vi.mocked(submitDragonGeneration).mockResolvedValueOnce("task_reclaimed");
+
+    const response = await POST(
+      createAuthedRequest("POST", "/api/generations", {
+        clientRequestId: "stale-reservation",
+        mode: "text",
+        prompt: "make a poster",
+        resolution: "2k",
+        size: "1:1"
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.job.id).toBe(stale.id);
+    expect(payload.job.dragonTaskId).toBe("task_reclaimed");
+    expect(payload.job.status).toBe("submitted");
+    expect(vi.mocked(submitDragonGeneration)).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
   it("polls failed tasks without auto-submitting replacement DragonCode jobs", async () => {
     const job = await createGenerationJob({
       clientRequestId: "poll-only",
@@ -176,5 +217,127 @@ describe("generation API routes", () => {
     expect(vi.mocked(submitDragonGeneration)).not.toHaveBeenCalled();
     expect(saved?.dragonTaskId).toBe("task_original");
     expect(saved?.status).toBe("failed");
+  });
+
+  it("filters history on the server", async () => {
+    await createGenerationJob({
+      clientRequestId: "api-text",
+      dragonTaskId: "task_api_text",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: ["https://example.com/text.png"],
+      progress: 100,
+      prompt: "quiet scene",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+    const matching = await createGenerationJob({
+      clientRequestId: "api-image",
+      dragonTaskId: "task_api_image",
+      errorMessage: null,
+      inputImages: [],
+      mode: "image",
+      outputImages: ["https://example.com/poster.png"],
+      progress: 100,
+      prompt: "boss poster",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+
+    const response = await GET(
+      createAuthedRequest("GET", "/api/generations?q=poster&status=completed&mode=image&pageSize=5")
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.jobs).toHaveLength(1);
+    expect(payload.jobs[0].id).toBe(matching.id);
+    expect(payload.pagination.total).toBe(1);
+  });
+
+  it("returns multiple local job statuses without polling DragonCode", async () => {
+    const first = await createGenerationJob({
+      clientRequestId: "status-one",
+      dragonTaskId: "task_status_one",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 10,
+      prompt: "first",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    const second = await createGenerationJob({
+      clientRequestId: "status-two",
+      dragonTaskId: "task_status_two",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: ["https://example.com/two.png"],
+      progress: 100,
+      prompt: "second",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+
+    const response = await GET_STATUS(
+      createAuthedRequest("GET", `/api/generations/status?ids=${first.id},${second.id},missing`)
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload.jobs.map((job: { id: string }) => job.id)).toEqual([second.id, first.id]);
+    expect(vi.mocked(fetchDragonTask)).not.toHaveBeenCalled();
+  });
+
+  it("bulk deletes selected history while keeping active jobs", async () => {
+    const active = await createGenerationJob({
+      clientRequestId: "delete-active",
+      dragonTaskId: "task_delete_active",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 20,
+      prompt: "active",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    const completed = await createGenerationJob({
+      clientRequestId: "delete-completed",
+      dragonTaskId: "task_delete_completed",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: ["https://example.com/done.png"],
+      progress: 100,
+      prompt: "completed",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+
+    const response = await BULK_DELETE(
+      createAuthedRequest("POST", "/api/generations/delete", {
+        ids: [active.id, completed.id, "missing"]
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload).toEqual({
+      deletedCount: 1,
+      notFoundIds: ["missing"],
+      skippedActive: 1
+    });
+    expect(await getGenerationJob(active.id)).not.toBeNull();
+    expect(await getGenerationJob(completed.id)).toBeNull();
   });
 });

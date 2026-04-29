@@ -229,4 +229,75 @@ describe("PostgreSQL generation job store", () => {
       }
     ]);
   });
+
+  it("filters and bulk deletes PostgreSQL jobs without deleting active records", async () => {
+    const db = newDb();
+    const { Pool } = db.adapters.createPg();
+
+    vi.doMock("pg", () => ({ Pool }));
+    vi.resetModules();
+    process.env.DATABASE_URL = "postgres://studio:secret@localhost/private_image_studio";
+
+    const store = await import("./store");
+    const active = await store.createGenerationJob({
+      clientRequestId: "pg-active",
+      dragonTaskId: "task_pg_active",
+      errorMessage: null,
+      inputImages: [],
+      mode: "image",
+      outputImages: [],
+      progress: 10,
+      prompt: "boss poster active",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    const completed = await store.createGenerationJob({
+      clientRequestId: "pg-completed",
+      dragonTaskId: "task_pg_completed",
+      errorMessage: null,
+      inputImages: [],
+      mode: "image",
+      outputImages: ["https://example.com/poster.png"],
+      progress: 100,
+      prompt: "boss poster final",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+    await store.createGenerationJob({
+      clientRequestId: "pg-other",
+      dragonTaskId: "task_pg_other",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: ["https://example.com/other.png"],
+      progress: 100,
+      prompt: "other scene",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+
+    await expect(
+      store.listGenerationJobsPage(undefined, {
+        mode: "image",
+        page: 1,
+        pageSize: 5,
+        query: "poster",
+        status: "completed"
+      })
+    ).resolves.toMatchObject({
+      jobs: [{ id: completed.id }],
+      total: 1
+    });
+    await expect(store.deleteGenerationJobs({ ids: [active.id, completed.id] })).resolves.toEqual({
+      deletedCount: 1,
+      notFoundIds: [],
+      skippedActive: 1
+    });
+    await expect(store.listGenerationJobsByIds([active.id, completed.id])).resolves.toMatchObject([
+      { id: active.id }
+    ]);
+  });
 });

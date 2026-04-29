@@ -17,14 +17,18 @@ type PollingOptions = {
   initialDelayMs?: number;
   intervalMs?: number;
   maxDurationMs?: number;
+  maxConcurrentFetches?: number;
 };
 
 const DEFAULT_INITIAL_DELAY_MS = 2500;
 const DEFAULT_INTERVAL_MS = 5000;
 const DEFAULT_MAX_DURATION_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_MAX_CONCURRENT_FETCHES = 4;
 const POLLING_TIMEOUT_MESSAGE = "生成任务超过最长等待时间，已停止轮询。请重新提交任务。";
 const activePolls = new Map<string, ReturnType<typeof setTimeout>>();
 const activeRuns = new Set<Promise<void>>();
+const pollFetchWaiters: Array<{ maxConcurrentFetches: number; resolve: () => void }> = [];
+let activePollFetches = 0;
 
 function isActiveJob(job: GenerationJob | null): job is ActiveGenerationJob {
   return (
@@ -48,6 +52,53 @@ function setBackgroundTimer(callback: () => void | Promise<void>, delayMs: numbe
 function trackActiveRun(run: Promise<void>) {
   activeRuns.add(run);
   run.finally(() => activeRuns.delete(run));
+}
+
+function normalizedFetchLimit(value: number | undefined): number {
+  return Number.isFinite(value) && value && value > 0
+    ? Math.floor(value)
+    : DEFAULT_MAX_CONCURRENT_FETCHES;
+}
+
+async function acquirePollFetchSlot(maxConcurrentFetches: number): Promise<void> {
+  if (activePollFetches < maxConcurrentFetches) {
+    activePollFetches += 1;
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    pollFetchWaiters.push({ maxConcurrentFetches, resolve });
+  });
+}
+
+function releasePollFetchSlot() {
+  activePollFetches = Math.max(0, activePollFetches - 1);
+
+  const nextIndex = pollFetchWaiters.findIndex(
+    (waiter) => activePollFetches < waiter.maxConcurrentFetches
+  );
+
+  if (nextIndex === -1) {
+    return;
+  }
+
+  const [next] = pollFetchWaiters.splice(nextIndex, 1);
+
+  activePollFetches += 1;
+  next.resolve();
+}
+
+async function withPollFetchSlot<T>(
+  maxConcurrentFetches: number | undefined,
+  operation: () => Promise<T>
+): Promise<T> {
+  await acquirePollFetchSlot(normalizedFetchLimit(maxConcurrentFetches));
+
+  try {
+    return await operation();
+  } finally {
+    releasePollFetchSlot();
+  }
 }
 
 function hasPollingTimedOut(job: GenerationJob, maxDurationMs: number): boolean {
@@ -77,7 +128,7 @@ async function markGenerationJobTimedOut(
 
 export async function pollGenerationJobOnce(
   jobId: string,
-  options: Pick<PollingOptions, "databasePath" | "maxDurationMs"> = {}
+  options: Pick<PollingOptions, "databasePath" | "maxDurationMs" | "maxConcurrentFetches"> = {}
 ): Promise<{ job: GenerationJob | null; shouldContinue: boolean }> {
   const job = await getGenerationJob(jobId, options.databasePath);
 
@@ -92,7 +143,9 @@ export async function pollGenerationJobOnce(
   }
 
   try {
-    const task = await fetchDragonTask(getDragonApiKey(), job.dragonTaskId);
+    const task = await withPollFetchSlot(options.maxConcurrentFetches, () =>
+      fetchDragonTask(getDragonApiKey(), job.dragonTaskId)
+    );
     const refreshed = await updateGenerationJob(
       job.id,
       {
@@ -174,6 +227,8 @@ export function resetGenerationPollingForTests() {
 
   activePolls.clear();
   activeRuns.clear();
+  pollFetchWaiters.splice(0);
+  activePollFetches = 0;
 }
 
 export async function waitForGenerationPollingForTests() {
