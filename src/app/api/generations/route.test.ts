@@ -13,6 +13,7 @@ import {
   submitDragonGeneration
 } from "@/lib/dragon-client";
 import { resetGenerationPollingForTests } from "@/lib/generation-poller";
+import { resetSubmissionLimiterForTests } from "@/lib/submission-limiter";
 import { GET, POST } from "./route";
 import { GET as GET_GENERATION } from "./[id]/route";
 import { POST as BULK_DELETE } from "./delete/route";
@@ -64,10 +65,12 @@ beforeEach(async () => {
   vi.mocked(submitDragonGeneration).mockReset();
   vi.mocked(fetchDragonTask).mockReset();
   resetGenerationPollingForTests();
+  resetSubmissionLimiterForTests();
 });
 
 afterEach(async () => {
   resetGenerationPollingForTests();
+  resetSubmissionLimiterForTests();
   vi.useRealTimers();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   delete process.env.DATABASE_PATH;
@@ -140,6 +143,57 @@ describe("generation API routes", () => {
     expect(firstPayload.job.id).toBe(secondPayload.job.id);
     expect(vi.mocked(submitDragonGeneration)).toHaveBeenCalledTimes(1);
     expect(await listGenerationJobs()).toHaveLength(1);
+  });
+
+  it("queues direct API submissions so DragonCode sees at most three concurrent requests", async () => {
+    let running = 0;
+    let started = 0;
+    let maxRunning = 0;
+    const releaseSubmissions: Array<() => void> = [];
+
+    vi.mocked(submitDragonGeneration).mockImplementation(async () => {
+      const taskIndex = started;
+
+      started += 1;
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+
+      await new Promise<void>((resolve) => {
+        releaseSubmissions.push(() => {
+          running -= 1;
+          resolve();
+        });
+      });
+
+      return `task_limited_${taskIndex}`;
+    });
+
+    const responsesPromise = Promise.all(
+      Array.from({ length: 6 }, (_value, index) =>
+        POST(
+          createAuthedRequest("POST", "/api/generations", {
+            clientRequestId: `api-limit-${index}`,
+            mode: "text",
+            prompt: `make poster ${index}`,
+            resolution: "2k",
+            size: "1:1"
+          })
+        )
+      )
+    );
+
+    await vi.waitFor(() => expect(started).toBe(3));
+    expect(maxRunning).toBe(3);
+    releaseSubmissions.splice(0).forEach((release) => release());
+
+    await vi.waitFor(() => expect(started).toBe(6));
+    expect(maxRunning).toBe(3);
+    releaseSubmissions.splice(0).forEach((release) => release());
+
+    const responses = await responsesPromise;
+
+    expect(responses.map((response) => response.status)).toEqual([201, 201, 201, 201, 201, 201]);
+    expect(vi.mocked(submitDragonGeneration)).toHaveBeenCalledTimes(6);
   });
 
   it("reclaims stale idempotent reservations that never received a DragonCode task id", async () => {

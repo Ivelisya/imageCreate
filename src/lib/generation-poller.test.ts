@@ -2,13 +2,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchDragonTask } from "./dragon-client";
+import { DragonCodeRequestError, fetchDragonTask } from "./dragon-client";
 import {
   createGenerationJob,
   getGenerationJob,
   listActiveGenerationJobs
 } from "./store";
 import {
+  calculatePollRetryDelayMs,
   pollGenerationJobOnce,
   resetGenerationPollingForTests,
   startActiveGenerationPolling,
@@ -188,7 +189,9 @@ describe("generation poller", () => {
       size: "1:1",
       status: "submitted"
     });
-    let resolveSlowPoll: ((value: Awaited<ReturnType<typeof fetchDragonTask>>) => void) | null = null;
+    let resolveSlowPoll: (value: Awaited<ReturnType<typeof fetchDragonTask>>) => void = () => {
+      throw new Error("slow poll resolver was not initialized");
+    };
     vi.mocked(fetchDragonTask)
       .mockReturnValueOnce(
         new Promise((resolve) => {
@@ -203,10 +206,11 @@ describe("generation poller", () => {
         status: "completed"
       });
 
-    const slowPoll = pollGenerationJobOnce(job.id);
-    const fastPoll = pollGenerationJobOnce(job.id);
+    const slowPoll = pollGenerationJobOnce(job.id, { maxConcurrentFetches: 2 });
+    const fastPoll = pollGenerationJobOnce(job.id, { maxConcurrentFetches: 2 });
     await fastPoll;
-    resolveSlowPoll?.({
+
+    resolveSlowPoll({
       dragonTaskId: "task_race",
       errorMessage: null,
       outputUrls: [],
@@ -289,5 +293,112 @@ describe("generation poller", () => {
     await Promise.all([firstPoll, secondPoll]);
     expect(vi.mocked(fetchDragonTask)).toHaveBeenCalledTimes(2);
     expect(maxRunning).toBe(1);
+  });
+
+  it("records transient polling failures and backs off the next poll", async () => {
+    const job = await createGenerationJob({
+      clientRequestId: "poll-backoff",
+      dragonTaskId: "task_backoff",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "backoff",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    vi.mocked(fetchDragonTask).mockRejectedValueOnce(new Error("upstream busy"));
+
+    const result = await pollGenerationJobOnce(job.id, {
+      intervalMs: 5000,
+      retryJitterMs: 0
+    });
+    const saved = await getGenerationJob(job.id);
+
+    expect(result).toMatchObject({
+      nextDelayMs: 10_000,
+      shouldContinue: true
+    });
+    expect(saved).toMatchObject({
+      retryCount: 1,
+      status: "submitted",
+      errorMessage: "DragonCode 查询暂时失败，系统正在自动降频重试。"
+    });
+  });
+
+  it("marks non-retriable DragonCode polling failures as failed immediately", async () => {
+    const job = await createGenerationJob({
+      clientRequestId: "poll-permanent-failure",
+      dragonTaskId: "task_permanent_failure",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "permanent failure",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    vi.mocked(fetchDragonTask).mockRejectedValueOnce(
+      new DragonCodeRequestError("DragonCode task query failed with DragonCode code 400", {
+        retriable: false,
+        status: 400
+      })
+    );
+
+    const result = await pollGenerationJobOnce(job.id, {
+      intervalMs: 5000,
+      retryJitterMs: 0
+    });
+    const saved = await getGenerationJob(job.id);
+
+    expect(result.shouldContinue).toBe(false);
+    expect(saved).toMatchObject({
+      status: "failed",
+      progress: 100,
+      errorMessage: "DragonCode task query failed with DragonCode code 400"
+    });
+  });
+
+  it("throttles active job recovery scans when status requests arrive frequently", async () => {
+    await createGenerationJob({
+      clientRequestId: "throttle-active-scans",
+      dragonTaskId: "task_throttle_scan",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "throttle scans",
+      resolution: "2k",
+      size: "1:1",
+      status: "pending"
+    });
+
+    await expect(
+      startActiveGenerationPolling({
+        initialDelayMs: 60_000,
+        maxActiveScanIntervalMs: 60_000
+      })
+    ).resolves.toBe(1);
+    await expect(
+      startActiveGenerationPolling({
+        initialDelayMs: 60_000,
+        maxActiveScanIntervalMs: 60_000
+      })
+    ).resolves.toBe(0);
+  });
+
+  it("caps exponential polling backoff", () => {
+    expect(
+      calculatePollRetryDelayMs(12, {
+        intervalMs: 5000,
+        maxRetryDelayMs: 60_000,
+        retryJitterMs: 0
+      })
+    ).toBe(60_000);
   });
 });

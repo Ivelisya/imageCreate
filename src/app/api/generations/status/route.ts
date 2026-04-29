@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { normalizeGenerationJobForResponse } from "@/lib/generation-response";
-import { startActiveGenerationPolling } from "@/lib/generation-poller";
+import { scheduleActiveGenerationPollingRecovery } from "@/lib/generation-poller";
 import { getCurrentUser } from "@/lib/server-auth";
 import { listGenerationJobsByIds } from "@/lib/store";
 
@@ -32,7 +32,7 @@ export async function GET(request: NextRequest) {
   }
 
   const jobs = await listGenerationJobsByIds(ids);
-  void startActiveGenerationPolling();
+  scheduleActiveGenerationPollingRecovery();
 
   return NextResponse.json({
     jobs: jobs.map(normalizeGenerationJobForResponse)

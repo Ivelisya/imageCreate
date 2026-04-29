@@ -1,4 +1,4 @@
-import { fetchDragonTask } from "./dragon-client";
+import { DragonCodeRequestError, fetchDragonTask } from "./dragon-client";
 import { getDragonApiKey } from "./env";
 import {
   getGenerationJob,
@@ -16,19 +16,28 @@ type PollingOptions = {
   databasePath?: string;
   initialDelayMs?: number;
   intervalMs?: number;
+  maxActiveScanIntervalMs?: number;
   maxDurationMs?: number;
   maxConcurrentFetches?: number;
+  maxRetryDelayMs?: number;
+  retryJitterMs?: number;
 };
 
 const DEFAULT_INITIAL_DELAY_MS = 2500;
 const DEFAULT_INTERVAL_MS = 5000;
 const DEFAULT_MAX_DURATION_MS = 2 * 60 * 60 * 1000;
-const DEFAULT_MAX_CONCURRENT_FETCHES = 4;
+const DEFAULT_MAX_CONCURRENT_FETCHES = 3;
+const DEFAULT_MAX_ACTIVE_SCAN_INTERVAL_MS = 60_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
+const DEFAULT_RETRY_JITTER_MS = 1000;
 const POLLING_TIMEOUT_MESSAGE = "生成任务超过最长等待时间，已停止轮询。请重新提交任务。";
+const TRANSIENT_POLLING_ERROR_MESSAGE = "DragonCode 查询暂时失败，系统正在自动降频重试。";
 const activePolls = new Map<string, ReturnType<typeof setTimeout>>();
 const activeRuns = new Set<Promise<void>>();
 const pollFetchWaiters: Array<{ maxConcurrentFetches: number; resolve: () => void }> = [];
 let activePollFetches = 0;
+let lastActiveScanStartedAt = 0;
+let activeScanRun: Promise<number> | null = null;
 
 function isActiveJob(job: GenerationJob | null): job is ActiveGenerationJob {
   return (
@@ -58,6 +67,19 @@ function normalizedFetchLimit(value: number | undefined): number {
   return Number.isFinite(value) && value && value > 0
     ? Math.floor(value)
     : DEFAULT_MAX_CONCURRENT_FETCHES;
+}
+
+export function calculatePollRetryDelayMs(
+  retryCount: number | undefined,
+  options: Pick<PollingOptions, "intervalMs" | "maxRetryDelayMs" | "retryJitterMs"> = {}
+): number {
+  const attempt = Math.max(1, Math.floor(retryCount ?? 1));
+  const baseDelayMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
+  const maxDelayMs = options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+  const exponentialDelayMs = baseDelayMs * 2 ** Math.min(attempt, 5);
+  const jitterMs = Math.floor(Math.random() * Math.max(0, options.retryJitterMs ?? DEFAULT_RETRY_JITTER_MS));
+
+  return Math.min(maxDelayMs, exponentialDelayMs + jitterMs);
 }
 
 async function acquirePollFetchSlot(maxConcurrentFetches: number): Promise<void> {
@@ -126,10 +148,26 @@ async function markGenerationJobTimedOut(
   );
 }
 
+function pollingErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return "DragonCode 查询失败。";
+}
+
 export async function pollGenerationJobOnce(
   jobId: string,
-  options: Pick<PollingOptions, "databasePath" | "maxDurationMs" | "maxConcurrentFetches"> = {}
-): Promise<{ job: GenerationJob | null; shouldContinue: boolean }> {
+  options: Pick<
+    PollingOptions,
+    | "databasePath"
+    | "intervalMs"
+    | "maxConcurrentFetches"
+    | "maxDurationMs"
+    | "maxRetryDelayMs"
+    | "retryJitterMs"
+  > = {}
+): Promise<{ job: GenerationJob | null; nextDelayMs?: number; shouldContinue: boolean }> {
   const job = await getGenerationJob(jobId, options.databasePath);
 
   if (!isActiveJob(job)) {
@@ -152,7 +190,8 @@ export async function pollGenerationJobOnce(
         status: task.status,
         progress: task.progress,
         outputImages: task.outputUrls,
-        errorMessage: task.errorMessage
+        errorMessage: task.errorMessage,
+        retryCount: 0
       },
       options.databasePath
     );
@@ -160,8 +199,36 @@ export async function pollGenerationJobOnce(
     const shouldContinue = updated.status === "pending" || updated.status === "submitted";
 
     return { job: updated, shouldContinue };
-  } catch {
-    return { job, shouldContinue: true };
+  } catch (error) {
+    if (error instanceof DragonCodeRequestError && !error.retriable) {
+      const failed = await updateGenerationJob(
+        job.id,
+        {
+          status: "failed",
+          progress: 100,
+          errorMessage: pollingErrorMessage(error)
+        },
+        options.databasePath
+      );
+
+      return { job: failed ?? job, shouldContinue: false };
+    }
+
+    const retryCount = (job.retryCount ?? 0) + 1;
+    const updated = await updateGenerationJob(
+      job.id,
+      {
+        retryCount,
+        errorMessage: TRANSIENT_POLLING_ERROR_MESSAGE
+      },
+      options.databasePath
+    );
+
+    return {
+      job: updated ?? job,
+      nextDelayMs: calculatePollRetryDelayMs(retryCount, options),
+      shouldContinue: true
+    };
   }
 }
 
@@ -193,7 +260,7 @@ export function startGenerationPolling(
       if (result.shouldContinue) {
         startGenerationPolling(jobId, {
           ...options,
-          initialDelayMs: options.intervalMs ?? DEFAULT_INTERVAL_MS
+          initialDelayMs: result.nextDelayMs ?? options.intervalMs ?? DEFAULT_INTERVAL_MS
         });
       }
     });
@@ -211,13 +278,45 @@ export function startGenerationPolling(
 export async function startActiveGenerationPolling(
   options: PollingOptions = {}
 ): Promise<number> {
-  const activeJobs = await listActiveGenerationJobs(options.databasePath);
+  const maxActiveScanIntervalMs = options.maxActiveScanIntervalMs ?? 0;
+  const now = Date.now();
 
-  for (const job of activeJobs) {
-    startGenerationPolling(job, options);
+  if (
+    maxActiveScanIntervalMs > 0 &&
+    lastActiveScanStartedAt > 0 &&
+    now - lastActiveScanStartedAt < maxActiveScanIntervalMs
+  ) {
+    return 0;
   }
 
-  return activeJobs.length;
+  if (activeScanRun) {
+    return activeScanRun;
+  }
+
+  activeScanRun = (async () => {
+    lastActiveScanStartedAt = Date.now();
+    const activeJobs = await listActiveGenerationJobs(options.databasePath);
+
+    for (const job of activeJobs) {
+      startGenerationPolling(job, options);
+    }
+
+    return activeJobs.length;
+  })();
+
+  try {
+    return await activeScanRun;
+  } finally {
+    activeScanRun = null;
+  }
+}
+
+export function scheduleActiveGenerationPollingRecovery(options: PollingOptions = {}): void {
+  void startActiveGenerationPolling({
+    ...options,
+    maxActiveScanIntervalMs:
+      options.maxActiveScanIntervalMs ?? DEFAULT_MAX_ACTIVE_SCAN_INTERVAL_MS
+  });
 }
 
 export function resetGenerationPollingForTests() {
@@ -229,6 +328,8 @@ export function resetGenerationPollingForTests() {
   activeRuns.clear();
   pollFetchWaiters.splice(0);
   activePollFetches = 0;
+  lastActiveScanStartedAt = 0;
+  activeScanRun = null;
 }
 
 export async function waitForGenerationPollingForTests() {

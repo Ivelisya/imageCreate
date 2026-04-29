@@ -67,7 +67,7 @@ export type DragonRequestOptions = {
   timeoutMs?: number;
 };
 
-class DragonCodeRequestError extends Error {
+export class DragonCodeRequestError extends Error {
   readonly retriable: boolean;
   readonly status?: number;
 
@@ -159,6 +159,24 @@ function toDragonRequestError(
   );
 }
 
+function assertDragonResponseCode(
+  response: { code?: number },
+  action: string
+): void {
+  if (typeof response.code === "number" && response.code !== 200) {
+    throw new DragonCodeRequestError(`${action} failed with DragonCode code ${response.code}`, {
+      retriable: response.code === 429 || response.code >= 500,
+      status: response.code
+    });
+  }
+}
+
+function parseDragonEnvelope<T extends { code?: number }>(response: T, action: string): T {
+  assertDragonResponseCode(response, action);
+
+  return response;
+}
+
 async function requestDragonJson<T>(
   path: string,
   init: RequestInit,
@@ -184,7 +202,7 @@ async function requestDragonJson<T>(
         });
       }
 
-      return (await response.json()) as T;
+      return parseDragonEnvelope((await response.json()) as T & { code?: number }, action) as T;
     } catch (error) {
       lastError = toDragonRequestError(error, action, options.timeoutMs);
 
@@ -209,6 +227,14 @@ async function requestDragonJson<T>(
 }
 
 export function parseDragonTask(response: DragonTaskResponse): NormalizedDragonTask {
+  assertDragonResponseCode(response, "DragonCode task query");
+
+  if (!response.data?.id) {
+    throw new DragonCodeRequestError("DragonCode task query response did not include task id", {
+      retriable: true
+    });
+  }
+
   const rawStatus = response.data.status;
   const status: DragonTaskStatus =
     rawStatus === "completed" || rawStatus === "failed" || rawStatus === "submitted"

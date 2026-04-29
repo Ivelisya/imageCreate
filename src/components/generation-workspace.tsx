@@ -12,9 +12,11 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import {
+  BATCH_SUBMIT_CONCURRENCY,
   BATCH_PROMPT_LIMIT,
   buildBatchPromptValidation,
-  createGenerationFingerprint
+  createGenerationFingerprint,
+  runWithConcurrencyLimit
 } from "@/lib/batch-generation";
 import { IMAGE_INPUT_LIMITS, validateClientImageFiles } from "@/lib/client-upload-validation";
 import { groupJobsByLocalDay } from "@/lib/history-groups";
@@ -80,7 +82,6 @@ type HistoryFilters = {
 const terminalStatuses = new Set(["completed", "failed"]);
 const activeStatuses = new Set(["queued", "submitted", "pending", "running", "processing"]);
 const HISTORY_PAGE_SIZE = 8;
-const BATCH_SUBMIT_DELAY_MS = 600;
 const statusText: Record<string, string> = {
   queued: "排队中",
   submitted: "已提交",
@@ -160,10 +161,6 @@ function modeLabel(mode?: string) {
   return mode === "image" ? "图 + 文" : "文生图";
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
 function historyFilterKey(filters: HistoryFilters): string {
   return `${filters.query}::${filters.status}::${filters.mode}`;
 }
@@ -180,6 +177,7 @@ export function GenerationWorkspace() {
   const [username, setUsername] = useState("");
   const [mode, setMode] = useState<GenerationMode>("text");
   const [isBatchMode, setIsBatchMode] = useState(false);
+  const [batchCopies, setBatchCopies] = useState(1);
   const [prompt, setPrompt] = useState("");
   const [resolution, setResolution] = useState<ImageResolution>("2k");
   const [size, setSize] = useState<ImageSize>("1:1");
@@ -209,8 +207,8 @@ export function GenerationWorkspace() {
   const supportedSizes = useMemo(() => supportedSizesForResolution(resolution), [resolution]);
   const historyGroups = useMemo(() => groupJobsByLocalDay(jobs), [jobs]);
   const promptValidation = useMemo(
-    () => buildBatchPromptValidation(prompt, isBatchMode),
-    [isBatchMode, prompt]
+    () => buildBatchPromptValidation(prompt, isBatchMode, batchCopies),
+    [batchCopies, isBatchMode, prompt]
   );
   const activeImages = extractImageUrls(activeJob);
   const isActiveJobGenerating = Boolean(
@@ -491,73 +489,83 @@ export function GenerationWorkspace() {
     setIsSubmitting(true);
     setBatchProgress({ completed: 0, total: promptValidation.prompts.length });
     const filesForSubmission = mode === "image" ? files : [];
-    let submittedCount = 0;
-    let firstError = "";
 
     try {
-      for (const [index, promptText] of promptValidation.prompts.entries()) {
-        const formData = new FormData();
-        const submissionFingerprint = createGenerationFingerprint({
-          files: filesForSubmission,
-          mode,
-          prompt: promptText,
-          resolution,
-          size
-        });
-        const clientRequestId = getClientRequestIdForFingerprint(submissionFingerprint);
+      const results = await runWithConcurrencyLimit(
+        promptValidation.prompts,
+        isBatchMode ? BATCH_SUBMIT_CONCURRENCY : 1,
+        async (promptText, index) => {
+          const formData = new FormData();
+          const submissionFingerprint = createGenerationFingerprint({
+            files: filesForSubmission,
+            mode,
+            prompt: promptText,
+            resolution,
+            size,
+            variantKey: isBatchMode ? `batch-${index}` : undefined
+          });
+          const clientRequestId = getClientRequestIdForFingerprint(submissionFingerprint);
 
-        formData.set("prompt", promptText);
-        formData.set("resolution", resolution);
-        formData.set("size", size);
-        formData.set("mode", mode);
-        formData.set("clientRequestId", clientRequestId);
-        filesForSubmission.forEach((file) => formData.append("images", file));
+          formData.set("prompt", promptText);
+          formData.set("resolution", resolution);
+          formData.set("size", size);
+          formData.set("mode", mode);
+          formData.set("clientRequestId", clientRequestId);
+          filesForSubmission.forEach((file) => formData.append("images", file));
 
-        const response = await fetch("/api/generations", {
-          method: "POST",
-          body: formData
-        });
-        const payload = (await response.json().catch(() => ({}))) as {
-          job?: GenerationJob;
-          error?: string;
-        };
+          const response = await fetch("/api/generations", {
+            method: "POST",
+            body: formData
+          });
+          const payload = (await response.json().catch(() => ({}))) as {
+            job?: GenerationJob;
+            error?: string;
+          };
 
-        if (payload.job) {
-          setActiveJob(payload.job);
-          setJobs((currentJobs) =>
-            [payload.job as GenerationJob, ...currentJobs.filter((job) => job.id !== payload.job?.id)].slice(
-              0,
-              HISTORY_PAGE_SIZE
-            )
+          if (payload.job) {
+            setActiveJob(payload.job);
+            setJobs((currentJobs) =>
+              [payload.job as GenerationJob, ...currentJobs.filter((job) => job.id !== payload.job?.id)].slice(
+                0,
+                HISTORY_PAGE_SIZE
+              )
+            );
+          }
+
+          if (!response.ok || !payload.job) {
+            throw new Error(`第 ${index + 1} 条提交失败：${payload.error ?? AMBIGUOUS_SUBMISSION_MESSAGE}`);
+          }
+
+          pendingSubmissionIdsRef.current.delete(submissionFingerprint);
+          setBatchProgress((currentProgress) => ({
+            completed: Math.min((currentProgress?.completed ?? 0) + 1, promptValidation.prompts.length),
+            total: promptValidation.prompts.length
+          }));
+
+          return payload.job;
+        }
+      );
+      const failures = results.filter((result) => result.status === "rejected");
+      const completedCount = results.filter((result) => result.status === "fulfilled").length;
+
+      await loadHistoryPage(1, { selectFirst: false }).catch(() => undefined);
+      if (failures.length > 0) {
+        const firstFailure = failures[0];
+        const reason = firstFailure.status === "rejected" ? firstFailure.reason : null;
+        const firstError = reason instanceof Error ? reason.message : AMBIGUOUS_SUBMISSION_MESSAGE;
+
+        if (completedCount > 0) {
+          setMessage(
+            `已提交 ${completedCount}/${promptValidation.prompts.length} 个任务，${failures.length} 个失败。${firstError}`
           );
+        } else {
+          setMessage(firstError);
         }
-
-        if (!response.ok || !payload.job) {
-          firstError = `第 ${index + 1} 条提交失败：${payload.error ?? AMBIGUOUS_SUBMISSION_MESSAGE}`;
-          break;
-        }
-
-        pendingSubmissionIdsRef.current.delete(submissionFingerprint);
-        submittedCount += 1;
-        setBatchProgress({ completed: submittedCount, total: promptValidation.prompts.length });
-
-        if (index < promptValidation.prompts.length - 1) {
-          await delay(BATCH_SUBMIT_DELAY_MS);
-        }
-      }
-
-      await loadHistoryPage(1, { selectFirst: true }).catch(() => undefined);
-      if (firstError) {
-        setMessage(
-          submittedCount > 0
-            ? `已提交 ${submittedCount}/${promptValidation.prompts.length} 个任务，${firstError}`
-            : firstError
-        );
       } else if (isBatchMode) {
-        setMessage(`已提交 ${submittedCount} 个任务，结果会自动刷新。`);
+        setMessage(`已提交 ${completedCount} 个任务，并发上限 ${BATCH_SUBMIT_CONCURRENCY}，结果会自动刷新。`);
       }
     } catch {
-      await loadHistoryPage(1, { selectFirst: true }).catch(() => undefined);
+      await loadHistoryPage(1, { selectFirst: false }).catch(() => undefined);
       setMessage(AMBIGUOUS_SUBMISSION_MESSAGE);
     } finally {
       submitInFlightRef.current = false;
@@ -813,9 +821,31 @@ export function GenerationWorkspace() {
               </label>
               <small>
                 {isBatchMode
-                  ? `一行一张，最多 ${BATCH_PROMPT_LIMIT} 条；参考图会应用到每条任务。`
-                  : "开启后可一次提交多条提示词，系统会按稳妥节奏排队提交。"}
+                  ? `用空行或 --- 分隔每张图；无分隔符时仍按每行一张。最多 ${BATCH_PROMPT_LIMIT} 个任务，并发 ${BATCH_SUBMIT_CONCURRENCY}。`
+                  : "开启后可一次提交多条提示词，系统会按受控并发提交。"}
               </small>
+              {isBatchMode ? (
+                <div className="batch-options">
+                  <label>
+                    <span>每条生成张数</span>
+                    <input
+                      max={BATCH_PROMPT_LIMIT}
+                      min={1}
+                      onChange={(event) => {
+                        const nextValue = Number.parseInt(event.target.value, 10);
+
+                        setBatchCopies(
+                          Number.isFinite(nextValue)
+                            ? Math.min(BATCH_PROMPT_LIMIT, Math.max(1, nextValue))
+                            : 1
+                        );
+                      }}
+                      type="number"
+                      value={batchCopies}
+                    />
+                  </label>
+                </div>
+              ) : null}
             </div>
 
             <div className="control-row">

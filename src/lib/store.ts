@@ -100,6 +100,15 @@ function getDatabaseUrl(): string | null {
 }
 
 function shouldUsePostgres(databasePath?: string): boolean {
+  if (
+    !databasePath &&
+    process.env.NODE_ENV === "production" &&
+    process.env.ALLOW_JSON_STORE_IN_PRODUCTION !== "true" &&
+    !getDatabaseUrl()
+  ) {
+    throw new Error("DATABASE_URL is required in production. JSON storage is for local development only.");
+  }
+
   return !databasePath && Boolean(getDatabaseUrl());
 }
 

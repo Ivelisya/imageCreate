@@ -9,8 +9,12 @@ import {
   type ImageSize
 } from "@/lib/image-options";
 import { normalizeGenerationJobForResponse } from "@/lib/generation-response";
-import { startActiveGenerationPolling, startGenerationPolling } from "@/lib/generation-poller";
+import {
+  scheduleActiveGenerationPollingRecovery,
+  startGenerationPolling
+} from "@/lib/generation-poller";
 import { getCurrentUser } from "@/lib/server-auth";
+import { withSubmissionConcurrencyLimit } from "@/lib/submission-limiter";
 import {
   createGenerationJob,
   listGenerationJobsPage,
@@ -229,11 +233,13 @@ async function parseGenerationRequest(request: NextRequest): Promise<ParsedGener
 
 class GenerationSubmissionError extends Error {
   readonly job: GenerationJob;
+  readonly statusCode: number;
 
-  constructor(message: string, job: GenerationJob) {
+  constructor(message: string, job: GenerationJob, statusCode = 502) {
     super(message);
     this.name = "GenerationSubmissionError";
     this.job = job;
+    this.statusCode = statusCode;
   }
 }
 
@@ -258,12 +264,14 @@ function isStaleReservedJobWithoutDragonTask(job: GenerationJob): boolean {
 async function submitAndCreateGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<GenerationJob> {
-  const dragonTaskId = await submitDragonGeneration(getDragonApiKey(), {
-    prompt: parsed.prompt,
-    resolution: parsed.resolution,
-    size: parsed.size,
-    imageUrls: parsed.imageUrls
-  });
+  const dragonTaskId = await withSubmissionConcurrencyLimit(() =>
+    submitDragonGeneration(getDragonApiKey(), {
+      prompt: parsed.prompt,
+      resolution: parsed.resolution,
+      size: parsed.size,
+      imageUrls: parsed.imageUrls
+    })
+  );
 
   return createGenerationJob({
     clientRequestId: parsed.clientRequestId,
@@ -319,12 +327,14 @@ async function submitAndUpdateReservedGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<GenerationJob> {
   try {
-    const dragonTaskId = await submitDragonGeneration(getDragonApiKey(), {
-      prompt: parsed.prompt,
-      resolution: parsed.resolution,
-      size: parsed.size,
-      imageUrls: parsed.imageUrls
-    });
+    const dragonTaskId = await withSubmissionConcurrencyLimit(() =>
+      submitDragonGeneration(getDragonApiKey(), {
+        prompt: parsed.prompt,
+        resolution: parsed.resolution,
+        size: parsed.size,
+        imageUrls: parsed.imageUrls
+      })
+    );
     const submitted = await updateGenerationJob(job.id, {
       dragonTaskId,
       status: "submitted",
@@ -381,7 +391,7 @@ export async function GET(request: NextRequest) {
     status
   });
   const jobs = result.jobs.map(normalizeGenerationJobForResponse);
-  void startActiveGenerationPolling();
+  scheduleActiveGenerationPollingRecovery();
 
   return NextResponse.json({
     jobs,
@@ -416,7 +426,7 @@ export async function POST(request: NextRequest) {
     if (error instanceof GenerationSubmissionError) {
       return NextResponse.json(
         { error: error.message, job: normalizeGenerationJobForResponse(error.job) },
-        { status: 502 }
+        { status: error.statusCode }
       );
     }
 

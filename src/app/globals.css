@@ -956,6 +956,16 @@ a:focus-visible {
   line-height: 1.45;
 }
 
+.batch-options {
+  display: grid;
+  grid-template-columns: minmax(0, 180px);
+  gap: var(--space-xs);
+}
+
+.batch-options input {
+  min-height: 44px;
+}
+
 .checkbox-line {
   min-height: 44px;
   display: flex;
@@ -1447,6 +1457,7 @@ a:focus-visible {
 
   .mobile-quick-nav {
     display: grid;
+    backdrop-filter: none;
   }
 
   .studio-shell::before {
@@ -1496,6 +1507,11 @@ a:focus-visible {
 
   .panel {
     padding: var(--space-md);
+  }
+
+  .panel::before,
+  .panel::after {
+    display: none;
   }
 
   .header-actions {

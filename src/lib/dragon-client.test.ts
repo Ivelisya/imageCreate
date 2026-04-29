@@ -116,6 +116,18 @@ describe("DragonCode client helpers", () => {
     );
   });
 
+  it("throws when DragonCode task polling returns a business error envelope", () => {
+    expect(() =>
+      parseDragonTask({
+        code: 500,
+        data: {
+          id: "task_business_error",
+          status: "pending"
+        }
+      })
+    ).toThrow("DragonCode task query failed with DragonCode code 500");
+  });
+
   it("aborts DragonCode task polling when the request exceeds its timeout", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(
@@ -173,6 +185,48 @@ describe("DragonCode client helpers", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       "[dragon-client] transient DragonCode request failure",
       expect.objectContaining({ action: "DragonCode submit", attempt: 1 })
+    );
+  });
+
+  it("retries retriable DragonCode business-code submit failures", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          Response.json({
+            code: 500,
+            data: []
+          })
+        )
+        .mockResolvedValueOnce(
+          Response.json({
+            code: 200,
+            data: [{ status: "submitted", task_id: "task_business_retry_ok" }]
+          })
+        )
+    );
+
+    await expect(
+      submitDragonGeneration(
+        "sk-test",
+        {
+          imageUrls: [],
+          prompt: "retry business code",
+          resolution: "2k",
+          size: "1:1"
+        },
+        { retryDelayMs: 0, retries: 1, timeoutMs: 1000 }
+      )
+    ).resolves.toBe("task_business_retry_ok");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[dragon-client] transient DragonCode request failure",
+      expect.objectContaining({
+        action: "DragonCode submit",
+        error: "DragonCode submit failed with DragonCode code 500"
+      })
     );
   });
 });
