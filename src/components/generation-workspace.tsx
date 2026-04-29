@@ -163,6 +163,12 @@ function modeLabel(mode?: string) {
   return mode === "image" ? "图 + 文" : "文生图";
 }
 
+function isGenerationJobActive(job?: GenerationJob | null): boolean {
+  return Boolean(
+    job?.status && activeStatuses.has(String(job.status)) && !terminalStatuses.has(String(job.status))
+  );
+}
+
 function imageSizeToAspectRatio(value?: string): string {
   const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(value ?? "");
   const width = match ? Number.parseFloat(match[1]) : 1;
@@ -224,9 +230,7 @@ export function GenerationWorkspace() {
   );
   const activeImages = extractImageUrls(activeJob);
   const activeImageFallbackRatio = imageSizeToAspectRatio(activeJob?.size ?? size);
-  const isActiveJobGenerating = Boolean(
-    activeJob?.status && activeStatuses.has(String(activeJob.status)) && !terminalStatuses.has(String(activeJob.status))
-  );
+  const isActiveJobGenerating = isGenerationJobActive(activeJob);
   const visibleActiveJobIds = useMemo(
     () =>
       jobs
@@ -619,6 +623,11 @@ export function GenerationWorkspace() {
   }
 
   async function handleDeleteJob(job: GenerationJob) {
+    if (isGenerationJobActive(job)) {
+      showMessage("生成中的任务会继续保留，完成或失败后再删除。", "warning");
+      return;
+    }
+
     const confirmed = window.confirm("确定要删除这条历史记录吗？这会从本地历史中移除该任务和图片链接。");
 
     if (!confirmed) {
@@ -663,6 +672,44 @@ export function GenerationWorkspace() {
     } finally {
       setDeletingJobId(null);
     }
+  }
+
+  async function handleCopyPrompt(job: GenerationJob) {
+    if (!job.prompt) {
+      showMessage("这条记录没有可复制的提示词。", "warning");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(job.prompt);
+      showMessage("提示词已复制。", "success");
+    } catch {
+      showMessage("复制失败，请手动选中文本复制。", "warning");
+    }
+  }
+
+  function handleReuseJob(job: GenerationJob) {
+    const nextMode: GenerationMode = job.mode === "image" ? "image" : "text";
+    const nextResolution = IMAGE_RESOLUTIONS.includes(job.resolution as ImageResolution)
+      ? (job.resolution as ImageResolution)
+      : "2k";
+    const nextSize = IMAGE_SIZES.includes(job.size as ImageSize)
+      ? (job.size as ImageSize)
+      : "1:1";
+
+    setPrompt(job.prompt ?? "");
+    setMode(nextMode);
+    setResolution(nextResolution);
+    setSize(nextSize);
+    clearMessage();
+
+    if (nextMode === "image") {
+      showMessage("已填入历史参数。图 + 文模式需要重新选择参考图。", "info");
+    } else {
+      showMessage("已填入历史参数，可直接调整后再次生成。", "success");
+    }
+
+    document.getElementById("composer-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function toggleJobSelection(jobId: string) {
@@ -886,6 +933,13 @@ export function GenerationWorkspace() {
                   </label>
                 </div>
               ) : null}
+              {isBatchMode ? (
+                <div className="batch-preview" aria-live="polite">
+                  {promptValidation.error
+                    ? promptValidation.error
+                    : `本次将提交 ${promptValidation.prompts.length} 个任务，最多同时 ${BATCH_SUBMIT_CONCURRENCY} 个。`}
+                </div>
+              ) : null}
             </div>
 
             <div className="control-row">
@@ -999,6 +1053,14 @@ export function GenerationWorkspace() {
                   {modeLabel(activeJob.mode)} / {activeJob.resolution ?? resolution} / {activeJob.size ?? size} /{" "}
                   {formatDate(activeJob.createdAt)}
                 </span>
+                <div className="task-actions" aria-label="当前任务操作">
+                  <button className="secondary-button" onClick={() => handleReuseJob(activeJob)} type="button">
+                    复用参数
+                  </button>
+                  <button className="secondary-button" onClick={() => void handleCopyPrompt(activeJob)} type="button">
+                    复制提示词
+                  </button>
+                </div>
               </div>
 
               {isActiveJobGenerating ? (
@@ -1161,6 +1223,7 @@ export function GenerationWorkspace() {
                   <div className="history-day-list">
                     {group.jobs.map((job) => {
                       const imageUrl = extractImageUrls(job)[0];
+                      const isJobActive = isGenerationJobActive(job);
 
                       return (
                         <div
@@ -1195,9 +1258,9 @@ export function GenerationWorkspace() {
                           <button
                             aria-label={`删除 ${job.prompt || "未命名生成"}`}
                             className="history-delete"
-                            disabled={deletingJobId === job.id}
+                            disabled={deletingJobId === job.id || isJobActive}
                             onClick={() => void handleDeleteJob(job)}
-                            title="删除历史记录"
+                            title={isJobActive ? "生成中的任务完成或失败后才能删除" : "删除历史记录"}
                             type="button"
                           >
                             {deletingJobId === job.id ? "..." : "×"}

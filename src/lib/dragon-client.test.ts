@@ -154,6 +154,25 @@ describe("DragonCode client helpers", () => {
     vi.useRealTimers();
   });
 
+  it("does not retry DragonCode submit failures by default", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("network reset after upstream may have accepted the request");
+      })
+    );
+
+    await expect(
+      submitDragonGeneration("sk-test", {
+        imageUrls: [],
+        prompt: "do not duplicate submit",
+        resolution: "2k",
+        size: "1:1"
+      })
+    ).rejects.toThrow("DragonCode submit failed: network reset after upstream may have accepted the request");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("retries transient DragonCode submit failures once before returning the task id", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.stubGlobal(

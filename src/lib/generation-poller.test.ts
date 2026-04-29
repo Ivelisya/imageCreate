@@ -207,6 +207,7 @@ describe("generation poller", () => {
       });
 
     const slowPoll = pollGenerationJobOnce(job.id, { maxConcurrentFetches: 2 });
+    await vi.waitFor(() => expect(vi.mocked(fetchDragonTask)).toHaveBeenCalledTimes(1));
     const fastPoll = pollGenerationJobOnce(job.id, { maxConcurrentFetches: 2 });
     await fastPoll;
 
@@ -400,5 +401,21 @@ describe("generation poller", () => {
         retryJitterMs: 0
       })
     ).toBe(60_000);
+  });
+
+  it("contains background polling storage failures instead of rejecting timer runs", async () => {
+    const brokenDirectory = await mkdtemp(join(tmpdir(), "pis-broken-store-"));
+    tempDirs.push(brokenDirectory);
+    process.env.DATABASE_PATH = brokenDirectory;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    startGenerationPolling("job-with-broken-store", { initialDelayMs: 0, intervalMs: 5000 });
+    await vi.runOnlyPendingTimersAsync();
+
+    await expect(waitForGenerationPollingForTests()).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[generation-poller] background polling failed",
+      expect.objectContaining({ jobId: "job-with-broken-store" })
+    );
   });
 });

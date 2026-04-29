@@ -3,7 +3,8 @@ import type { ImageResolution, ImageSize } from "./image-options";
 const DRAGON_BASE_URL = "https://dragoncode.codes/gpt-image/v1";
 const DEFAULT_SUBMIT_TIMEOUT_MS = 45_000;
 const DEFAULT_TASK_TIMEOUT_MS = 15_000;
-const DEFAULT_RETRIES = 1;
+const DEFAULT_SUBMIT_RETRIES = 0;
+const DEFAULT_TASK_RETRIES = 1;
 const DEFAULT_RETRY_DELAY_MS = 500;
 
 export type GenerationMode = "text" | "image";
@@ -269,7 +270,7 @@ export async function submitDragonGeneration(
     },
     "DragonCode submit",
     {
-      retries: options.retries ?? DEFAULT_RETRIES,
+      retries: options.retries ?? DEFAULT_SUBMIT_RETRIES,
       retryDelayMs: options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
       timeoutMs: options.timeoutMs ?? DEFAULT_SUBMIT_TIMEOUT_MS
     }
@@ -298,7 +299,7 @@ export async function fetchDragonTask(
       },
       "DragonCode task query",
       {
-        retries: options.retries ?? DEFAULT_RETRIES,
+        retries: options.retries ?? DEFAULT_TASK_RETRIES,
         retryDelayMs: options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
         timeoutMs: options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS
       }

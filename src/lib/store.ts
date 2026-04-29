@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { Pool, type QueryResultRow } from "pg";
+import { Pool, type PoolConfig, type QueryResultRow } from "pg";
 import type { GenerationMode } from "./dragon-client";
 import type { ImageResolution, ImageSize } from "./image-options";
 
@@ -48,6 +48,7 @@ export type GenerationJobListOptions = {
   query?: string;
   status?: GenerationJobStatusFilter;
   mode?: GenerationMode;
+  includeInputImages?: boolean;
 };
 
 export type DeleteGenerationJobsScope = "completed" | "failed" | "all";
@@ -86,6 +87,8 @@ const storeWriteLocks = new Map<string, Promise<void>>();
 const postgresSchemaLocks = new Map<string, Promise<void>>();
 let postgresPool: Pool | null = null;
 let postgresPoolConnectionString: string | null = null;
+let postgresPromptSearchIndexWarningShown = false;
+let postgresLegacyJsonMigrationWarningShown = false;
 
 export function getDatabasePath(): string {
   return resolve(process.env.DATABASE_PATH || "./data/private-image-studio.json");
@@ -97,6 +100,23 @@ function resolveDatabasePath(databasePath?: string): string {
 
 function getDatabaseUrl(): string | null {
   return process.env.DATABASE_URL || null;
+}
+
+function parsePositiveEnvInteger(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10);
+
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function buildPostgresPoolConfig(connectionString: string): PoolConfig {
+  return {
+    connectionString,
+    connectionTimeoutMillis: parsePositiveEnvInteger("POSTGRES_CONNECTION_TIMEOUT_MS", 5_000),
+    idleTimeoutMillis: parsePositiveEnvInteger("POSTGRES_IDLE_TIMEOUT_MS", 30_000),
+    max: parsePositiveEnvInteger("POSTGRES_POOL_MAX", 6),
+    query_timeout: parsePositiveEnvInteger("POSTGRES_QUERY_TIMEOUT_MS", 15_000),
+    statement_timeout: parsePositiveEnvInteger("POSTGRES_STATEMENT_TIMEOUT_MS", 15_000)
+  };
 }
 
 function shouldUsePostgres(databasePath?: string): boolean {
@@ -254,7 +274,7 @@ function getPostgresPool(): Pool {
 
   if (!postgresPool || postgresPoolConnectionString !== connectionString) {
     void postgresPool?.end();
-    postgresPool = new Pool({ connectionString });
+    postgresPool = new Pool(buildPostgresPoolConfig(connectionString));
     postgresPoolConnectionString = connectionString;
   }
 
@@ -304,6 +324,150 @@ async function addPostgresColumnIfMissing(
   }
 
   await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+async function ensurePostgresPromptSearchIndex(pool: Pool): Promise<void> {
+  if (process.env.NODE_ENV === "test") {
+    return;
+  }
+
+  try {
+    await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS generation_jobs_prompt_trgm_idx
+      ON generation_jobs USING gin (lower(prompt) gin_trgm_ops)
+    `);
+  } catch (error) {
+    if (!postgresPromptSearchIndexWarningShown) {
+      postgresPromptSearchIndexWarningShown = true;
+      console.warn("[store] could not ensure prompt trigram index", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+}
+
+async function migrateLegacyJsonStoreToPostgresIfNeeded(pool: Pool): Promise<void> {
+  const legacyDatabasePath = process.env.DATABASE_PATH;
+
+  if (!legacyDatabasePath) {
+    return;
+  }
+
+  try {
+    const legacyStore = await readStore(resolve(legacyDatabasePath));
+    const legacyJobs = legacyStore.jobs.filter((job) => typeof job.id === "string" && job.id.length > 0);
+
+    if (legacyJobs.length === 0) {
+      return;
+    }
+
+    const existingIds = await pool.query(
+      "SELECT id FROM generation_jobs WHERE id = ANY($1::text[])",
+      [legacyJobs.map((job) => job.id)]
+    );
+    const existingIdSet = new Set(existingIds.rows.map((row) => String(row.id)));
+    const missingJobs = legacyJobs.filter((job) => !existingIdSet.has(job.id));
+
+    if (missingJobs.length === 0) {
+      return;
+    }
+
+    await pool.query("BEGIN");
+
+    try {
+      let insertedCount = 0;
+      const insertLegacyJob = async (job: GenerationJob, clientRequestId: string | null) => {
+        const result = await pool.query(
+          `
+            INSERT INTO generation_jobs (
+              id,
+              dragon_task_id,
+              client_request_id,
+              mode,
+              prompt,
+              resolution,
+              size,
+              status,
+              progress,
+              input_images,
+              output_images,
+              error_message,
+              retry_count,
+              created_at,
+              updated_at,
+              completed_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16)
+            ON CONFLICT DO NOTHING
+            RETURNING id
+          `,
+          [
+            job.id,
+            job.dragonTaskId,
+            clientRequestId,
+            job.mode,
+            job.prompt,
+            job.resolution,
+            job.size,
+            job.status,
+            job.progress,
+            JSON.stringify(job.inputImages ?? []),
+            JSON.stringify(job.outputImages ?? []),
+            job.errorMessage,
+            job.retryCount ?? 0,
+            job.createdAt,
+            job.updatedAt,
+            job.completedAt
+          ]
+        );
+
+        return (result.rowCount ?? 0) > 0;
+      };
+
+      for (const job of missingJobs) {
+        let inserted = await insertLegacyJob(job, job.clientRequestId ?? null);
+
+        if (!inserted && job.clientRequestId) {
+          inserted = await insertLegacyJob(job, null);
+        }
+
+        if (inserted) {
+          insertedCount += 1;
+        }
+      }
+
+      if (legacyStore.ownerAccount) {
+        await pool.query(
+          `
+            INSERT INTO owner_account (singleton_key, username, password_hash, created_at)
+            VALUES (1, $1, $2, $3)
+            ON CONFLICT (singleton_key) DO NOTHING
+          `,
+          [
+            legacyStore.ownerAccount.username,
+            legacyStore.ownerAccount.passwordHash,
+            legacyStore.ownerAccount.createdAt
+          ]
+        );
+      }
+
+      await pool.query("COMMIT");
+      console.info("[store] migrated legacy JSON generation history to PostgreSQL", {
+        count: insertedCount
+      });
+    } catch (error) {
+      await pool.query("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    if (!postgresLegacyJsonMigrationWarningShown) {
+      postgresLegacyJsonMigrationWarningShown = true;
+      console.warn("[store] could not migrate legacy JSON store to PostgreSQL", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 }
 
 async function ensurePostgresSchema(): Promise<void> {
@@ -383,6 +547,7 @@ async function ensurePostgresSchema(): Promise<void> {
       CREATE INDEX IF NOT EXISTS generation_jobs_dragon_task_id_idx
       ON generation_jobs (dragon_task_id)
     `);
+    await ensurePostgresPromptSearchIndex(pool);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS owner_account (
         singleton_key integer PRIMARY KEY DEFAULT 1 CHECK (singleton_key = 1),
@@ -391,6 +556,7 @@ async function ensurePostgresSchema(): Promise<void> {
         created_at timestamptz NOT NULL
       )
     `);
+    await migrateLegacyJsonStoreToPostgresIfNeeded(pool);
   })();
 
   postgresSchemaLocks.set(connectionString, pending);
@@ -434,6 +600,20 @@ function toIsoString(value: unknown): string {
   return new Date().toISOString();
 }
 
+function currentIsoString(): string {
+  return new Date().toISOString();
+}
+
+function nextIsoStringAfter(previous: string | null | undefined): string {
+  const nowMs = Date.now();
+  const previousMs = Date.parse(previous ?? "");
+  const nextMs = Number.isFinite(previousMs) && nowMs <= previousMs
+    ? previousMs + 1
+    : nowMs;
+
+  return new Date(nextMs).toISOString();
+}
+
 function rowToGenerationJob(row: QueryResultRow): GenerationJob {
   return {
     id: String(row.id),
@@ -463,8 +643,33 @@ function rowToOwnerAccount(row: QueryResultRow): OwnerAccount {
   };
 }
 
+function postgresGenerationJobSelectColumns(options: { includeInputImages?: boolean } = {}): string {
+  const inputImagesSql = options.includeInputImages === false
+    ? "'[]'::jsonb AS input_images"
+    : "input_images";
+
+  return `
+    id,
+    dragon_task_id,
+    client_request_id,
+    mode,
+    prompt,
+    resolution,
+    size,
+    status,
+    progress,
+    ${inputImagesSql},
+    output_images,
+    error_message,
+    retry_count,
+    created_at,
+    updated_at,
+    completed_at
+  `;
+}
+
 function buildGenerationJob(input: NewGenerationJob): GenerationJob {
-  const now = new Date().toISOString();
+  const now = currentIsoString();
 
   return {
     ...input,
@@ -547,6 +752,7 @@ async function listPostgresGenerationJobsPage(options: {
   query?: string;
   status?: GenerationJobStatusFilter;
   mode?: GenerationMode;
+  includeInputImages?: boolean;
 } = {}): Promise<GenerationJobsPage> {
   await ensurePostgresSchema();
   const pageSize = Math.max(1, Math.floor(options.pageSize ?? 10));
@@ -584,7 +790,7 @@ async function listPostgresGenerationJobsPage(options: {
   const offset = (page - 1) * pageSize;
   const result = await getPostgresPool().query(
     `
-      SELECT *
+      SELECT ${postgresGenerationJobSelectColumns({ includeInputImages: options.includeInputImages })}
       FROM generation_jobs
       ${whereSql}
       ORDER BY created_at DESC, id DESC
@@ -633,6 +839,26 @@ async function getPostgresGenerationJobByClientRequestId(
   const result = await getPostgresPool().query(
     "SELECT * FROM generation_jobs WHERE client_request_id = $1 LIMIT 1",
     [clientRequestId]
+  );
+
+  return result.rows[0] ? rowToGenerationJob(result.rows[0]) : null;
+}
+
+async function claimPostgresReservedGenerationJobForSubmission(
+  job: GenerationJob
+): Promise<GenerationJob | null> {
+  await ensurePostgresSchema();
+  const result = await getPostgresPool().query(
+    `
+      UPDATE generation_jobs
+      SET updated_at = $2
+      WHERE id = $1
+        AND status = 'pending'
+        AND dragon_task_id IS NULL
+        AND updated_at = $3
+      RETURNING *
+    `,
+    [job.id, nextIsoStringAfter(job.updatedAt), job.updatedAt]
   );
 
   return result.rows[0] ? rowToGenerationJob(result.rows[0]) : null;
@@ -791,7 +1017,7 @@ async function updatePostgresGenerationJob(
     return existing;
   }
 
-  const now = new Date().toISOString();
+  const now = nextIsoStringAfter(existing.updatedAt);
   const status = updates.status ?? existing.status;
   const job: GenerationJob = {
     ...existing,
@@ -869,7 +1095,7 @@ async function createPostgresOwnerAccount(input: NewOwnerAccount): Promise<Owner
   await ensurePostgresSchema();
   const ownerAccount: OwnerAccount = {
     ...input,
-    createdAt: new Date().toISOString()
+    createdAt: currentIsoString()
   };
 
   try {
@@ -983,6 +1209,43 @@ export async function getGenerationJobByClientRequestId(
   return data.jobs.find((job) => job.clientRequestId === clientRequestId) ?? null;
 }
 
+export async function claimReservedGenerationJobForSubmission(
+  job: GenerationJob,
+  databasePath?: string
+): Promise<GenerationJob | null> {
+  if (shouldUsePostgres(databasePath)) {
+    return claimPostgresReservedGenerationJobForSubmission(job);
+  }
+
+  const resolvedPath = resolveDatabasePath(databasePath);
+
+  return withStoreWriteLock(resolvedPath, async () => {
+    const data = await readStore(resolvedPath);
+    const existing = data.jobs.find((currentJob) => currentJob.id === job.id);
+
+    if (
+      !existing ||
+      existing.status !== "pending" ||
+      existing.dragonTaskId ||
+      existing.updatedAt !== job.updatedAt
+    ) {
+      return null;
+    }
+
+    const claimed: GenerationJob = {
+      ...existing,
+      updatedAt: nextIsoStringAfter(existing.updatedAt)
+    };
+
+    await writeStore({
+      ...data,
+      jobs: data.jobs.map((currentJob) => currentJob.id === claimed.id ? claimed : currentJob)
+    }, resolvedPath);
+
+    return claimed;
+  });
+}
+
 export async function createGenerationJob(
   input: NewGenerationJob,
   databasePath?: string
@@ -1050,13 +1313,13 @@ export async function updateGenerationJob(
       return null;
     }
 
-    const now = new Date().toISOString();
     const existing = data.jobs[index];
 
     if (isTerminalGenerationStatus(existing.status)) {
       return existing;
     }
 
+    const now = nextIsoStringAfter(existing.updatedAt);
     const status = updates.status ?? existing.status;
     const job: GenerationJob = {
       ...existing,
@@ -1183,7 +1446,7 @@ export async function createOwnerAccount(
 
     const ownerAccount: OwnerAccount = {
       ...input,
-      createdAt: new Date().toISOString()
+      createdAt: currentIsoString()
     };
 
     await writeStore({ ...data, ownerAccount }, resolvedPath);

@@ -63,6 +63,10 @@ function trackActiveRun(run: Promise<void>) {
   run.finally(() => activeRuns.delete(run));
 }
 
+function formatBackgroundError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function normalizedFetchLimit(value: number | undefined): number {
   return Number.isFinite(value) && value && value > 0
     ? Math.floor(value)
@@ -256,14 +260,21 @@ export function startGenerationPolling(
 
   const timer = setBackgroundTimer(() => {
     activePolls.delete(jobId);
-    const run = pollGenerationJobOnce(jobId, options).then((result) => {
-      if (result.shouldContinue) {
-        startGenerationPolling(jobId, {
-          ...options,
-          initialDelayMs: result.nextDelayMs ?? options.intervalMs ?? DEFAULT_INTERVAL_MS
+    const run = pollGenerationJobOnce(jobId, options)
+      .then((result) => {
+        if (result.shouldContinue) {
+          startGenerationPolling(jobId, {
+            ...options,
+            initialDelayMs: result.nextDelayMs ?? options.intervalMs ?? DEFAULT_INTERVAL_MS
+          });
+        }
+      })
+      .catch((error) => {
+        console.error("[generation-poller] background polling failed", {
+          error: formatBackgroundError(error),
+          jobId
         });
-      }
-    });
+      });
 
     trackActiveRun(run);
 
@@ -316,6 +327,10 @@ export function scheduleActiveGenerationPollingRecovery(options: PollingOptions 
     ...options,
     maxActiveScanIntervalMs:
       options.maxActiveScanIntervalMs ?? DEFAULT_MAX_ACTIVE_SCAN_INTERVAL_MS
+  }).catch((error) => {
+    console.error("[generation-poller] active polling recovery failed", {
+      error: formatBackgroundError(error)
+    });
   });
 }
 

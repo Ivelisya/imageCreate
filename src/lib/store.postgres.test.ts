@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newDb } from "pg-mem";
@@ -121,6 +121,92 @@ describe("PostgreSQL generation job store", () => {
     expect(second.created).toBe(false);
     expect(second.job.id).toBe(first.job.id);
     expect(rows).toMatchObject([{ id: first.job.id, prompt: "first prompt" }]);
+  });
+
+  it("migrates legacy JSON history into PostgreSQL when the database starts empty", async () => {
+    const db = newDb();
+    const { Pool } = db.adapters.createPg();
+    const fallbackPath = await createJsonFallbackPath();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    await writeFile(
+      fallbackPath,
+      JSON.stringify({
+        jobs: [
+          {
+            id: "legacy-job-1",
+            clientRequestId: "legacy-client",
+            dragonTaskId: "legacy-task-1",
+            mode: "text",
+            prompt: "legacy prompt",
+            resolution: "2k",
+            size: "1:1",
+            status: "completed",
+            progress: 100,
+            inputImages: ["data:image/png;base64,legacy"],
+            outputImages: ["https://example.com/legacy.png"],
+            errorMessage: null,
+            retryCount: 0,
+            createdAt: "2026-04-29T00:00:00.000Z",
+            updatedAt: "2026-04-29T00:01:00.000Z",
+            completedAt: "2026-04-29T00:01:00.000Z"
+          },
+          {
+            id: "legacy-job-2",
+            clientRequestId: "legacy-client",
+            dragonTaskId: "legacy-task-2",
+            mode: "text",
+            prompt: "legacy duplicate client id",
+            resolution: "2k",
+            size: "1:1",
+            status: "failed",
+            progress: 100,
+            inputImages: [],
+            outputImages: [],
+            errorMessage: "legacy failure",
+            retryCount: 0,
+            createdAt: "2026-04-29T00:02:00.000Z",
+            updatedAt: "2026-04-29T00:03:00.000Z",
+            completedAt: "2026-04-29T00:03:00.000Z"
+          }
+        ],
+        ownerAccount: {
+          username: "legacy-owner",
+          passwordHash: "legacy-hash",
+          createdAt: "2026-04-29T00:00:00.000Z"
+        }
+      }),
+      "utf8"
+    );
+
+    vi.doMock("pg", () => ({ Pool }));
+    vi.resetModules();
+    process.env.DATABASE_URL = "postgres://studio:secret@localhost/private_image_studio";
+    process.env.DATABASE_PATH = fallbackPath;
+
+    const store = await import("./store");
+
+    await expect(store.listGenerationJobsPage(undefined, { page: 1, pageSize: 5 })).resolves.toMatchObject({
+      jobs: [
+        {
+          id: "legacy-job-2",
+          prompt: "legacy duplicate client id",
+          status: "failed"
+        },
+        {
+          id: "legacy-job-1",
+          outputImages: ["https://example.com/legacy.png"],
+          prompt: "legacy prompt",
+          status: "completed"
+        }
+      ],
+      total: 2
+    });
+    await expect(store.getOwnerAccount()).resolves.toMatchObject({ username: "legacy-owner" });
+    expect(infoSpy).toHaveBeenCalledWith(
+      "[store] migrated legacy JSON generation history to PostgreSQL",
+      { count: 2 }
+    );
   });
 
   it("migrates an existing PostgreSQL jobs table before using idempotency columns", async () => {
@@ -299,5 +385,48 @@ describe("PostgreSQL generation job store", () => {
     await expect(store.listGenerationJobsByIds([active.id, completed.id])).resolves.toMatchObject([
       { id: active.id }
     ]);
+  });
+
+  it("can list PostgreSQL history without loading stored input images", async () => {
+    const db = newDb();
+    const { Pool } = db.adapters.createPg();
+
+    vi.doMock("pg", () => ({ Pool }));
+    vi.resetModules();
+    process.env.DATABASE_URL = "postgres://studio:secret@localhost/private_image_studio";
+
+    const store = await import("./store");
+    const job = await store.createGenerationJob({
+      clientRequestId: "pg-large-input",
+      dragonTaskId: "task_pg_large_input",
+      errorMessage: null,
+      inputImages: ["data:image/png;base64," + "a".repeat(1024)],
+      mode: "image",
+      outputImages: ["https://example.com/final.png"],
+      progress: 100,
+      prompt: "large input row",
+      resolution: "2k",
+      size: "1:1",
+      status: "completed"
+    });
+
+    await expect(store.getGenerationJob(job.id)).resolves.toMatchObject({
+      id: job.id,
+      inputImages: ["data:image/png;base64," + "a".repeat(1024)]
+    });
+    await expect(
+      store.listGenerationJobsPage(undefined, {
+        includeInputImages: false,
+        page: 1,
+        pageSize: 5
+      })
+    ).resolves.toMatchObject({
+      jobs: [
+        {
+          id: job.id,
+          inputImages: []
+        }
+      ]
+    });
   });
 });

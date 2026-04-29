@@ -13,7 +13,10 @@ import {
   submitDragonGeneration
 } from "@/lib/dragon-client";
 import { resetGenerationPollingForTests } from "@/lib/generation-poller";
-import { resetSubmissionLimiterForTests } from "@/lib/submission-limiter";
+import {
+  getSubmissionLimiterStateForTests,
+  resetSubmissionLimiterForTests
+} from "@/lib/submission-limiter";
 import { GET, POST } from "./route";
 import { GET as GET_GENERATION } from "./[id]/route";
 import { POST as BULK_DELETE } from "./delete/route";
@@ -76,6 +79,8 @@ afterEach(async () => {
   delete process.env.DATABASE_PATH;
   delete process.env.DRAGON_API_KEY;
   delete process.env.SESSION_SECRET;
+  delete process.env.SUBMISSION_CONCURRENCY;
+  delete process.env.SUBMISSION_MAX_QUEUED;
 });
 
 describe("generation API routes", () => {
@@ -94,6 +99,25 @@ describe("generation API routes", () => {
 
     expect(response.status).toBe(400);
     expect(payload.error).toBe("参考图最多支持 16 张。");
+    expect(vi.mocked(submitDragonGeneration)).not.toHaveBeenCalled();
+  });
+
+  it("rejects generation requests whose declared body is too large before parsing uploads", async () => {
+    const request = createAuthedRequest("POST", "/api/generations", {
+      clientRequestId: "too-large-body",
+      mode: "text",
+      prompt: "make a poster",
+      resolution: "2k",
+      size: "1:1"
+    });
+
+    request.headers.set("content-length", String(65 * 1024 * 1024));
+
+    const response = await POST(request);
+    const payload = await response.json();
+
+    expect(response.status).toBe(413);
+    expect(payload.error).toContain("上传内容过大");
     expect(vi.mocked(submitDragonGeneration)).not.toHaveBeenCalled();
   });
 
@@ -194,6 +218,73 @@ describe("generation API routes", () => {
 
     expect(responses.map((response) => response.status)).toEqual([201, 201, 201, 201, 201, 201]);
     expect(vi.mocked(submitDragonGeneration)).toHaveBeenCalledTimes(6);
+  });
+
+  it("returns 429 without reserving a local job when the submission queue is full", async () => {
+    process.env.SUBMISSION_CONCURRENCY = "1";
+    process.env.SUBMISSION_MAX_QUEUED = "1";
+    resetSubmissionLimiterForTests();
+    let started = 0;
+    const releaseSubmissions: Array<() => void> = [];
+
+    vi.mocked(submitDragonGeneration).mockImplementation(async () => {
+      const taskIndex = started;
+
+      started += 1;
+      await new Promise<void>((resolve) => {
+        releaseSubmissions.push(resolve);
+      });
+
+      return `task_queue_full_${taskIndex}`;
+    });
+
+    const first = POST(
+      createAuthedRequest("POST", "/api/generations", {
+        clientRequestId: "queue-full-active",
+        mode: "text",
+        prompt: "active submit",
+        resolution: "2k",
+        size: "1:1"
+      })
+    );
+    await vi.waitFor(() => expect(started).toBe(1));
+    const second = POST(
+      createAuthedRequest("POST", "/api/generations", {
+        clientRequestId: "queue-full-waiting",
+        mode: "text",
+        prompt: "queued submit",
+        resolution: "2k",
+        size: "1:1"
+      })
+    );
+    await vi.waitFor(() =>
+      expect(getSubmissionLimiterStateForTests()).toMatchObject({
+        activeSubmissions: 1,
+        queuedSubmissions: 1
+      })
+    );
+    const overflow = await POST(
+      createAuthedRequest("POST", "/api/generations", {
+        clientRequestId: "queue-full-overflow",
+        mode: "text",
+        prompt: "overflow submit",
+        resolution: "2k",
+        size: "1:1"
+      })
+    );
+    const payload = await overflow.json();
+
+    expect(overflow.status).toBe(429);
+    expect(payload.error).toContain("提交队列已满");
+    expect((await listGenerationJobs()).some((job) => job.clientRequestId === "queue-full-overflow")).toBe(false);
+
+    releaseSubmissions.shift()?.();
+    await first;
+    await vi.waitFor(() => expect(started).toBe(2));
+    releaseSubmissions.shift()?.();
+    await second;
+    delete process.env.SUBMISSION_CONCURRENCY;
+    delete process.env.SUBMISSION_MAX_QUEUED;
   });
 
   it("reclaims stale idempotent reservations that never received a DragonCode task id", async () => {
@@ -346,7 +437,7 @@ describe("generation API routes", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(200);
-    expect(payload.jobs.map((job: { id: string }) => job.id)).toEqual([second.id, first.id]);
+    expect(payload.jobs.map((job: { id: string }) => job.id).sort()).toEqual([first.id, second.id].sort());
     expect(vi.mocked(fetchDragonTask)).not.toHaveBeenCalled();
   });
 
@@ -393,5 +484,33 @@ describe("generation API routes", () => {
     });
     expect(await getGenerationJob(active.id)).not.toBeNull();
     expect(await getGenerationJob(completed.id)).toBeNull();
+  });
+
+  it("rejects deleting an active job so the upstream DragonCode task remains traceable", async () => {
+    const active = await createGenerationJob({
+      clientRequestId: "delete-active-single",
+      dragonTaskId: "task_delete_active_single",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 20,
+      prompt: "active single",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+
+    const response = await (
+      await import("./[id]/route")
+    ).DELETE(
+      createAuthedRequest("DELETE", `/api/generations/${active.id}`),
+      { params: Promise.resolve({ id: active.id }) }
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(payload.error).toContain("生成中的任务不能删除");
+    expect(await getGenerationJob(active.id)).not.toBeNull();
   });
 });

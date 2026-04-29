@@ -14,9 +14,11 @@ import {
   startGenerationPolling
 } from "@/lib/generation-poller";
 import { getCurrentUser } from "@/lib/server-auth";
-import { withSubmissionConcurrencyLimit } from "@/lib/submission-limiter";
+import { SubmissionQueueFullError, withSubmissionConcurrencyLimit } from "@/lib/submission-limiter";
 import {
+  claimReservedGenerationJobForSubmission,
   createGenerationJob,
+  getGenerationJobByClientRequestId,
   listGenerationJobsPage,
   reserveGenerationJob,
   updateGenerationJob,
@@ -24,6 +26,7 @@ import {
   type GenerationJobStatusFilter
 } from "@/lib/store";
 import {
+  IMAGE_INPUT_LIMITS,
   fileToDataUri,
   isUploadedFile,
   validateImageUrlInputs,
@@ -33,6 +36,7 @@ import {
 const DEFAULT_HISTORY_PAGE_SIZE = 5;
 const MAX_HISTORY_PAGE_SIZE = 30;
 const STALE_RESERVED_JOB_MS = 2 * 60 * 1000;
+const MAX_GENERATION_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 const validStatusFilters = new Set<GenerationJobStatusFilter>([
   "active",
   "completed",
@@ -256,22 +260,20 @@ function isStaleReservedJobWithoutDragonTask(job: GenerationJob): boolean {
     return false;
   }
 
-  const createdAtMs = Date.parse(job.createdAt);
+  const updatedAtMs = Date.parse(job.updatedAt);
 
-  return Number.isFinite(createdAtMs) && Date.now() - createdAtMs > STALE_RESERVED_JOB_MS;
+  return Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs > STALE_RESERVED_JOB_MS;
 }
 
 async function submitAndCreateGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<GenerationJob> {
-  const dragonTaskId = await withSubmissionConcurrencyLimit(() =>
-    submitDragonGeneration(getDragonApiKey(), {
-      prompt: parsed.prompt,
-      resolution: parsed.resolution,
-      size: parsed.size,
-      imageUrls: parsed.imageUrls
-    })
-  );
+  const dragonTaskId = await submitDragonGeneration(getDragonApiKey(), {
+    prompt: parsed.prompt,
+    resolution: parsed.resolution,
+    size: parsed.size,
+    imageUrls: parsed.imageUrls
+  });
 
   return createGenerationJob({
     clientRequestId: parsed.clientRequestId,
@@ -307,8 +309,14 @@ async function reserveSubmitAndUpdateGenerationJob(
 
   if (!reserved.created) {
     if (isStaleReservedJobWithoutDragonTask(reserved.job)) {
+      const claimedJob = await claimReservedGenerationJobForSubmission(reserved.job);
+
+      if (!claimedJob) {
+        return reserved;
+      }
+
       return {
-        job: await submitAndUpdateReservedGenerationJob(reserved.job, parsed),
+        job: await submitAndUpdateReservedGenerationJob(claimedJob, parsed),
         created: false
       };
     }
@@ -327,14 +335,12 @@ async function submitAndUpdateReservedGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<GenerationJob> {
   try {
-    const dragonTaskId = await withSubmissionConcurrencyLimit(() =>
-      submitDragonGeneration(getDragonApiKey(), {
-        prompt: parsed.prompt,
-        resolution: parsed.resolution,
-        size: parsed.size,
-        imageUrls: parsed.imageUrls
-      })
-    );
+    const dragonTaskId = await submitDragonGeneration(getDragonApiKey(), {
+      prompt: parsed.prompt,
+      resolution: parsed.resolution,
+      size: parsed.size,
+      imageUrls: parsed.imageUrls
+    });
     const submitted = await updateGenerationJob(job.id, {
       dragonTaskId,
       status: "submitted",
@@ -359,15 +365,27 @@ async function createOrReuseGenerationJob(
   parsed: ParsedGenerationRequest
 ): Promise<{ job: GenerationJob; created: boolean }> {
   if (!parsed.clientRequestId) {
-    return {
+    return withSubmissionConcurrencyLimit(async () => ({
       job: await submitAndCreateGenerationJob(parsed),
       created: true
-    };
+    }));
   }
 
   return withSubmissionLock(parsed.clientRequestId, async () => {
-    return reserveSubmitAndUpdateGenerationJob(parsed);
+    const existing = await getGenerationJobByClientRequestId(parsed.clientRequestId as string);
+
+    if (existing && !isStaleReservedJobWithoutDragonTask(existing)) {
+      return { job: existing, created: false };
+    }
+
+    return withSubmissionConcurrencyLimit(() => reserveSubmitAndUpdateGenerationJob(parsed));
   });
+}
+
+function isRequestBodyTooLarge(request: NextRequest): boolean {
+  const contentLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
+
+  return Number.isFinite(contentLength) && contentLength > MAX_GENERATION_REQUEST_BODY_BYTES;
 }
 
 export async function GET(request: NextRequest) {
@@ -384,6 +402,7 @@ export async function GET(request: NextRequest) {
   const mode = parseModeFilter(request.nextUrl.searchParams.get("mode"));
   const query = parseSearchQuery(request.nextUrl.searchParams.get("q"));
   const result = await listGenerationJobsPage(undefined, {
+    includeInputImages: false,
     mode,
     page,
     pageSize,
@@ -409,6 +428,15 @@ export async function POST(request: NextRequest) {
     return unauthorized();
   }
 
+  if (isRequestBodyTooLarge(request)) {
+    return NextResponse.json(
+      {
+        error: `上传内容过大。最多支持 ${IMAGE_INPUT_LIMITS.maxImageCount} 张参考图，总大小不超过 ${Math.floor(IMAGE_INPUT_LIMITS.maxTotalImageBytes / 1024 / 1024)}MB。`
+      },
+      { status: 413 }
+    );
+  }
+
   const parsed = await parseGenerationRequest(request);
   if ("error" in parsed) {
     return NextResponse.json({ error: parsed.error }, { status: 400 });
@@ -423,6 +451,13 @@ export async function POST(request: NextRequest) {
       { status: created ? 201 : 200 }
     );
   } catch (error) {
+    if (error instanceof SubmissionQueueFullError) {
+      return NextResponse.json(
+        { error: "提交队列已满，请稍后再试。" },
+        { status: 429 }
+      );
+    }
+
     if (error instanceof GenerationSubmissionError) {
       return NextResponse.json(
         { error: error.message, job: normalizeGenerationJobForResponse(error.job) },

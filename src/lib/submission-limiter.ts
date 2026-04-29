@@ -5,13 +5,32 @@ type SubmissionWaiter = {
   resolve: (release: () => void) => void;
 };
 
+export class SubmissionQueueFullError extends Error {
+  constructor() {
+    super("生成提交队列已满，请稍后再试。");
+    this.name = "SubmissionQueueFullError";
+  }
+}
+
 let activeSubmissions = 0;
 const submissionWaiters: SubmissionWaiter[] = [];
 
 function normalizedLimit(value: number | undefined): number {
-  return Number.isFinite(value) && value && value > 0
-    ? Math.floor(value)
+  const envLimit = Number.parseInt(process.env.SUBMISSION_CONCURRENCY ?? "", 10);
+  const fallback = Number.isFinite(envLimit) && envLimit > 0
+    ? envLimit
     : DEFAULT_SUBMISSION_CONCURRENCY;
+
+  return Number.isFinite(value) && value && value > 0 ? Math.floor(value) : fallback;
+}
+
+function normalizedMaxQueued(value: number | undefined): number {
+  const envMaxQueued = Number.parseInt(process.env.SUBMISSION_MAX_QUEUED ?? "", 10);
+  const fallback = Number.isFinite(envMaxQueued) && envMaxQueued > 0
+    ? envMaxQueued
+    : DEFAULT_MAX_QUEUED_SUBMISSIONS;
+
+  return Math.max(1, Math.floor(value ?? fallback));
 }
 
 function releaseSubmissionSlot() {
@@ -38,10 +57,10 @@ async function acquireSubmissionSlot(options: {
     return releaseSubmissionSlot;
   }
 
-  const maxQueued = Math.max(1, Math.floor(options.maxQueued ?? DEFAULT_MAX_QUEUED_SUBMISSIONS));
+  const maxQueued = normalizedMaxQueued(options.maxQueued);
 
-  while (submissionWaiters.length >= maxQueued) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  if (submissionWaiters.length >= maxQueued) {
+    throw new SubmissionQueueFullError();
   }
 
   return new Promise((resolve) => {
@@ -68,4 +87,11 @@ export async function withSubmissionConcurrencyLimit<T>(
 export function resetSubmissionLimiterForTests() {
   activeSubmissions = 0;
   submissionWaiters.splice(0);
+}
+
+export function getSubmissionLimiterStateForTests() {
+  return {
+    activeSubmissions,
+    queuedSubmissions: submissionWaiters.length
+  };
 }

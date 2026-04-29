@@ -45,6 +45,19 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
   }
 
   const { id } = await context.params;
+  const job = await getGenerationJob(id);
+
+  if (!job) {
+    return NextResponse.json({ error: "没有找到这条生成记录。" }, { status: 404 });
+  }
+
+  if (job.status === "pending" || job.status === "submitted") {
+    return NextResponse.json(
+      { error: "生成中的任务不能删除，请等待完成或失败后再删除。" },
+      { status: 409 }
+    );
+  }
+
   const deleted = await deleteGenerationJob(id);
 
   if (!deleted) {
