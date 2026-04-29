@@ -3,6 +3,7 @@
 import {
   ChangeEvent,
   FormEvent,
+  SyntheticEvent,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -78,6 +79,7 @@ type HistoryFilters = {
   query: string;
   status: HistoryStatusFilter;
 };
+type MessageTone = "error" | "info" | "success" | "warning";
 
 const terminalStatuses = new Set(["completed", "failed"]);
 const activeStatuses = new Set(["queued", "submitted", "pending", "running", "processing"]);
@@ -161,6 +163,14 @@ function modeLabel(mode?: string) {
   return mode === "image" ? "图 + 文" : "文生图";
 }
 
+function imageSizeToAspectRatio(value?: string): string {
+  const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(value ?? "");
+  const width = match ? Number.parseFloat(match[1]) : 1;
+  const height = match ? Number.parseFloat(match[2]) : 1;
+
+  return width > 0 && height > 0 ? `${width} / ${height}` : "1 / 1";
+}
+
 function historyFilterKey(filters: HistoryFilters): string {
   return `${filters.query}::${filters.status}::${filters.mode}`;
 }
@@ -203,6 +213,8 @@ export function GenerationWorkspace() {
   const [historyModeFilter, setHistoryModeFilter] = useState<HistoryModeFilter>("all");
   const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(() => new Set());
   const [message, setMessage] = useState("");
+  const [messageTone, setMessageTone] = useState<MessageTone>("info");
+  const [resultImageRatios, setResultImageRatios] = useState<Record<string, string>>({});
 
   const supportedSizes = useMemo(() => supportedSizesForResolution(resolution), [resolution]);
   const historyGroups = useMemo(() => groupJobsByLocalDay(jobs), [jobs]);
@@ -211,6 +223,7 @@ export function GenerationWorkspace() {
     [batchCopies, isBatchMode, prompt]
   );
   const activeImages = extractImageUrls(activeJob);
+  const activeImageFallbackRatio = imageSizeToAspectRatio(activeJob?.size ?? size);
   const isActiveJobGenerating = Boolean(
     activeJob?.status && activeStatuses.has(String(activeJob.status)) && !terminalStatuses.has(String(activeJob.status))
   );
@@ -305,6 +318,29 @@ export function GenerationWorkspace() {
     }
   }, []);
 
+  const showMessage = useCallback((text: string, tone: MessageTone = "error") => {
+    setMessage(text);
+    setMessageTone(tone);
+  }, []);
+
+  const clearMessage = useCallback(() => {
+    setMessage("");
+  }, []);
+
+  function handleResultImageLoad(url: string, event: SyntheticEvent<HTMLImageElement>) {
+    const { naturalHeight, naturalWidth } = event.currentTarget;
+
+    if (naturalWidth <= 0 || naturalHeight <= 0) {
+      return;
+    }
+
+    const nextRatio = `${naturalWidth} / ${naturalHeight}`;
+
+    setResultImageRatios((current) =>
+      current[url] === nextRatio ? current : { ...current, [url]: nextRatio }
+    );
+  }
+
   useEffect(() => {
     if (!supportedSizes.includes(size)) {
       setSize(supportedSizes[0]);
@@ -334,7 +370,7 @@ export function GenerationWorkspace() {
         await loadHistoryPage(1, { selectFirst: true });
       } catch (error) {
         if (!cancelled) {
-          setMessage(error instanceof Error ? error.message : "无法加载工作台。");
+          showMessage(error instanceof Error ? error.message : "无法加载工作台。");
         }
       } finally {
         if (!cancelled) {
@@ -348,7 +384,7 @@ export function GenerationWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [loadHistoryPage, router]);
+  }, [loadHistoryPage, router, showMessage]);
 
   useEffect(() => {
     const filters: HistoryFilters = {
@@ -363,16 +399,18 @@ export function GenerationWorkspace() {
       return;
     }
 
-    setMessage("");
+    clearMessage();
     void loadHistoryPage(1, { filters, selectFirst: true }).catch((error) => {
-      setMessage(error instanceof Error ? error.message : "无法加载生成历史。");
+      showMessage(error instanceof Error ? error.message : "无法加载生成历史。");
     });
   }, [
+    clearMessage,
     deferredHistorySearch,
     historyModeFilter,
     historyStatusFilter,
     isLoading,
-    loadHistoryPage
+    loadHistoryPage,
+    showMessage
   ]);
 
   useEffect(() => {
@@ -424,7 +462,7 @@ export function GenerationWorkspace() {
 
   function handleModeChange(nextMode: GenerationMode) {
     setMode(nextMode);
-    setMessage("");
+    clearMessage();
 
     if (nextMode === "text") {
       clearSelectedFiles();
@@ -440,12 +478,12 @@ export function GenerationWorkspace() {
     if (validationError) {
       setFiles([]);
       event.target.value = "";
-      setMessage(validationError);
+      showMessage(validationError);
       return;
     }
 
     setFiles(nextFiles);
-    setMessage("");
+    clearMessage();
   }
 
   function getClientRequestIdForFingerprint(fingerprint: string): string {
@@ -464,20 +502,20 @@ export function GenerationWorkspace() {
 
   async function handleGenerate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setMessage("");
+    clearMessage();
 
     if (!canSubmit) {
-      setMessage(promptValidation.error ?? fileValidationError ?? "请先选择支持的分辨率和画幅比例。");
+      showMessage(promptValidation.error ?? fileValidationError ?? "请先选择支持的分辨率和画幅比例。");
       return;
     }
 
     if (mode === "image" && files.length === 0) {
-      setMessage("图 + 文模式至少需要上传一张参考图。");
+      showMessage("图 + 文模式至少需要上传一张参考图。");
       return;
     }
 
     if (fileValidationError) {
-      setMessage(fileValidationError);
+      showMessage(fileValidationError);
       return;
     }
 
@@ -555,18 +593,19 @@ export function GenerationWorkspace() {
         const firstError = reason instanceof Error ? reason.message : AMBIGUOUS_SUBMISSION_MESSAGE;
 
         if (completedCount > 0) {
-          setMessage(
-            `已提交 ${completedCount}/${promptValidation.prompts.length} 个任务，${failures.length} 个失败。${firstError}`
+          showMessage(
+            `已提交 ${completedCount}/${promptValidation.prompts.length} 个任务，${failures.length} 个失败。${firstError}`,
+            "warning"
           );
         } else {
-          setMessage(firstError);
+          showMessage(firstError);
         }
       } else if (isBatchMode) {
-        setMessage(`已提交 ${completedCount} 个任务，并发上限 ${BATCH_SUBMIT_CONCURRENCY}，结果会自动刷新。`);
+        showMessage(`已提交 ${completedCount} 个任务，并发上限 ${BATCH_SUBMIT_CONCURRENCY}，结果会自动刷新。`, "success");
       }
     } catch {
       await loadHistoryPage(1, { selectFirst: false }).catch(() => undefined);
-      setMessage(AMBIGUOUS_SUBMISSION_MESSAGE);
+      showMessage(AMBIGUOUS_SUBMISSION_MESSAGE, "warning");
     } finally {
       submitInFlightRef.current = false;
       setIsSubmitting(false);
@@ -587,14 +626,14 @@ export function GenerationWorkspace() {
     }
 
     setDeletingJobId(job.id);
-    setMessage("");
+    clearMessage();
 
     try {
       const response = await fetch(`/api/generations/${job.id}`, { method: "DELETE" });
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
 
       if (!response.ok) {
-        setMessage(payload.error ?? "删除失败，请稍后重试。");
+        showMessage(payload.error ?? "删除失败，请稍后重试。");
         return;
       }
 
@@ -617,10 +656,10 @@ export function GenerationWorkspace() {
           total,
           totalPages
         }));
-        setMessage("已删除，但刷新历史失败，请稍后再试。");
+        showMessage("已删除，但刷新历史失败，请稍后再试。", "warning");
       }
     } catch {
-      setMessage("删除请求失败，请稍后重试。");
+      showMessage("删除请求失败，请稍后重试。");
     } finally {
       setDeletingJobId(null);
     }
@@ -673,7 +712,7 @@ export function GenerationWorkspace() {
     }
 
     setIsBulkDeleting(true);
-    setMessage("");
+    clearMessage();
 
     try {
       const response = await fetch("/api/generations/delete", {
@@ -693,19 +732,20 @@ export function GenerationWorkspace() {
       };
 
       if (!response.ok) {
-        setMessage(payload.error ?? "删除失败，请稍后重试。");
+        showMessage(payload.error ?? "删除失败，请稍后重试。");
         return;
       }
 
       setSelectedJobIds(new Set());
       await loadHistoryPage(1, { selectFirst: true });
-      setMessage(
+      showMessage(
         `已删除 ${payload.deletedCount ?? 0} 条历史${
           payload.skippedActive ? `，保留 ${payload.skippedActive} 条生成中任务` : ""
-        }。`
+        }。`,
+        "success"
       );
     } catch {
-      setMessage("删除请求失败，请稍后重试。");
+      showMessage("删除请求失败，请稍后重试。");
     } finally {
       setIsBulkDeleting(false);
     }
@@ -721,12 +761,12 @@ export function GenerationWorkspace() {
       return;
     }
 
-    setMessage("");
+    clearMessage();
 
     try {
       await loadHistoryPage(page, { selectFirst: true });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法加载生成历史。");
+      showMessage(error instanceof Error ? error.message : "无法加载生成历史。");
     }
   }
 
@@ -922,7 +962,11 @@ export function GenerationWorkspace() {
               <p className="hint">当前有任务生成中，新任务会受控提交并自动刷新结果。</p>
             ) : null}
 
-            {message ? <p className="form-error">{message}</p> : null}
+            {message ? (
+              <p className={`form-message form-message-${messageTone}`} role={messageTone === "error" ? "alert" : "status"}>
+                {message}
+              </p>
+            ) : null}
 
             <button className="primary-button" disabled={!canSubmit} type="submit">
               {isSubmitting
@@ -981,9 +1025,19 @@ export function GenerationWorkspace() {
               {activeImages.length > 0 ? (
                 <div className="image-grid">
                   {activeImages.map((url) => (
-                    <a href={url} key={url} rel="noreferrer" target="_blank">
+                    <a
+                      href={url}
+                      key={url}
+                      rel="noreferrer"
+                      style={{ aspectRatio: resultImageRatios[url] ?? activeImageFallbackRatio }}
+                      target="_blank"
+                    >
                       {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img alt={activeJob.prompt ?? "生成图片"} src={url} />
+                      <img
+                        alt={activeJob.prompt ?? "生成图片"}
+                        onLoad={(event) => handleResultImageLoad(url, event)}
+                        src={url}
+                      />
                     </a>
                   ))}
                 </div>
