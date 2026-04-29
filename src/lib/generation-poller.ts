@@ -25,7 +25,6 @@ const DEFAULT_MAX_DURATION_MS = 2 * 60 * 60 * 1000;
 const POLLING_TIMEOUT_MESSAGE = "生成任务超过最长等待时间，已停止轮询。请重新提交任务。";
 const activePolls = new Map<string, ReturnType<typeof setTimeout>>();
 const activeRuns = new Set<Promise<void>>();
-const pollStartedAt = new Map<string, number>();
 
 function isActiveJob(job: GenerationJob | null): job is ActiveGenerationJob {
   return (
@@ -51,11 +50,21 @@ function trackActiveRun(run: Promise<void>) {
   run.finally(() => activeRuns.delete(run));
 }
 
-function markGenerationJobTimedOut(
+function hasPollingTimedOut(job: GenerationJob, maxDurationMs: number): boolean {
+  const createdAtMs = Date.parse(job.createdAt);
+
+  if (!Number.isFinite(createdAtMs)) {
+    return false;
+  }
+
+  return Date.now() - createdAtMs > maxDurationMs;
+}
+
+async function markGenerationJobTimedOut(
   jobId: string,
   options: Pick<PollingOptions, "databasePath"> = {}
-) {
-  const run = updateGenerationJob(
+): Promise<GenerationJob | null> {
+  return updateGenerationJob(
     jobId,
     {
       status: "failed",
@@ -63,20 +72,23 @@ function markGenerationJobTimedOut(
       errorMessage: POLLING_TIMEOUT_MESSAGE
     },
     options.databasePath
-  ).then(() => undefined);
-
-  trackActiveRun(run);
+  );
 }
 
 export async function pollGenerationJobOnce(
   jobId: string,
-  options: Pick<PollingOptions, "databasePath"> = {}
+  options: Pick<PollingOptions, "databasePath" | "maxDurationMs"> = {}
 ): Promise<{ job: GenerationJob | null; shouldContinue: boolean }> {
   const job = await getGenerationJob(jobId, options.databasePath);
 
   if (!isActiveJob(job)) {
-    pollStartedAt.delete(jobId);
     return { job, shouldContinue: false };
+  }
+
+  if (hasPollingTimedOut(job, options.maxDurationMs ?? DEFAULT_MAX_DURATION_MS)) {
+    const timedOut = await markGenerationJobTimedOut(job.id, options);
+
+    return { job: timedOut ?? job, shouldContinue: false };
   }
 
   try {
@@ -93,10 +105,6 @@ export async function pollGenerationJobOnce(
     );
     const updated = refreshed ?? job;
     const shouldContinue = updated.status === "pending" || updated.status === "submitted";
-
-    if (!shouldContinue) {
-      pollStartedAt.delete(jobId);
-    }
 
     return { job: updated, shouldContinue };
   } catch {
@@ -119,15 +127,10 @@ export function startGenerationPolling(
     return false;
   }
 
-  const now = Date.now();
-  const startedAt = pollStartedAt.get(jobId) ?? now;
   const maxDurationMs = options.maxDurationMs ?? DEFAULT_MAX_DURATION_MS;
 
-  pollStartedAt.set(jobId, startedAt);
-
-  if (now - startedAt > maxDurationMs) {
-    pollStartedAt.delete(jobId);
-    markGenerationJobTimedOut(jobId, options);
+  if (inputJob && hasPollingTimedOut(inputJob, maxDurationMs)) {
+    trackActiveRun(markGenerationJobTimedOut(jobId, options).then(() => undefined));
     return false;
   }
 
@@ -171,7 +174,6 @@ export function resetGenerationPollingForTests() {
 
   activePolls.clear();
   activeRuns.clear();
-  pollStartedAt.clear();
 }
 
 export async function waitForGenerationPollingForTests() {

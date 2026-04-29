@@ -2,6 +2,7 @@
 
 import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { IMAGE_INPUT_LIMITS, validateClientImageFiles } from "@/lib/client-upload-validation";
 import { groupJobsByLocalDay } from "@/lib/history-groups";
 import {
   IMAGE_RESOLUTIONS,
@@ -188,8 +189,18 @@ export function GenerationWorkspace() {
   const isActiveJobGenerating = Boolean(
     activeJob?.status && activeStatuses.has(String(activeJob.status)) && !terminalStatuses.has(String(activeJob.status))
   );
+  const hasActiveGeneration = Boolean(
+    isActiveJobGenerating ||
+      jobs.some((job) => job.status && activeStatuses.has(String(job.status)) && !terminalStatuses.has(String(job.status)))
+  );
+  const fileValidationError = mode === "image" ? validateClientImageFiles(files) : null;
   const canSubmit =
-    prompt.trim().length > 0 && !isSubmitting && isSupportedImageOption({ resolution, size });
+    prompt.trim().length > 0 &&
+    !isSubmitting &&
+    !hasActiveGeneration &&
+    !fileValidationError &&
+    (mode !== "image" || files.length > 0) &&
+    isSupportedImageOption({ resolution, size });
 
   const loadHistoryPage = useCallback(async (page: number, options?: { selectFirst?: boolean }) => {
     setIsHistoryPageLoading(true);
@@ -318,13 +329,48 @@ export function GenerationWorkspace() {
     return () => window.clearInterval(interval);
   }, [activeJob?.id, activeJob?.status]);
 
+  function clearSelectedFiles() {
+    setFiles([]);
+    pendingSubmissionRef.current = null;
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function handleModeChange(nextMode: GenerationMode) {
+    setMode(nextMode);
+    setMessage("");
+
+    if (nextMode === "text") {
+      clearSelectedFiles();
+    }
+  }
+
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    setFiles(Array.from(event.target.files ?? []));
+    const nextFiles = Array.from(event.target.files ?? []);
+    const validationError = validateClientImageFiles(nextFiles);
+
+    pendingSubmissionRef.current = null;
+
+    if (validationError) {
+      setFiles([]);
+      event.target.value = "";
+      setMessage(validationError);
+      return;
+    }
+
+    setFiles(nextFiles);
+    setMessage("");
   }
 
   async function handleGenerate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setMessage("");
+
+    if (hasActiveGeneration) {
+      setMessage("当前已有任务生成中，请等待完成后再提交。");
+      return;
+    }
 
     if (!canSubmit) {
       setMessage("请先选择支持的分辨率和画幅比例。");
@@ -336,6 +382,11 @@ export function GenerationWorkspace() {
       return;
     }
 
+    if (fileValidationError) {
+      setMessage(fileValidationError);
+      return;
+    }
+
     if (submitInFlightRef.current) {
       return;
     }
@@ -344,8 +395,9 @@ export function GenerationWorkspace() {
     setIsSubmitting(true);
 
     const formData = new FormData();
+    const filesForSubmission = mode === "image" ? files : [];
     const submissionFingerprint = createSubmissionFingerprint({
-      files,
+      files: filesForSubmission,
       mode,
       prompt,
       resolution,
@@ -366,7 +418,7 @@ export function GenerationWorkspace() {
     formData.set("size", size);
     formData.set("mode", mode);
     formData.set("clientRequestId", clientRequestId);
-    files.forEach((file) => formData.append("images", file));
+    filesForSubmission.forEach((file) => formData.append("images", file));
 
     try {
       const response = await fetch("/api/generations", {
@@ -443,26 +495,27 @@ export function GenerationWorkspace() {
         return;
       }
 
-      setJobs((currentJobs) => {
-        const remainingJobs = currentJobs.filter((item) => item.id !== job.id);
+      const total = Math.max(0, historyPagination.total - 1);
+      const totalPages = Math.max(1, Math.ceil(total / historyPagination.pageSize));
+      const page = Math.min(historyPagination.page, totalPages);
 
-        if (activeJob?.id === job.id) {
-          setActiveJob(remainingJobs[0] ?? null);
-        }
+      try {
+        await loadHistoryPage(page, { selectFirst: true });
+      } catch {
+        const remainingJobs = jobs.filter((item) => item.id !== job.id);
 
-        return remainingJobs;
-      });
-      setHistoryPagination((current) => {
-        const total = Math.max(0, current.total - 1);
-        const totalPages = Math.max(1, Math.ceil(total / current.pageSize));
-
-        return {
+        setJobs(remainingJobs);
+        setActiveJob((currentJob) =>
+          currentJob?.id === job.id ? remainingJobs[0] ?? null : currentJob
+        );
+        setHistoryPagination((current) => ({
           ...current,
+          page,
           total,
-          totalPages,
-          page: Math.min(current.page, totalPages)
-        };
-      });
+          totalPages
+        }));
+        setMessage("已删除，但刷新历史失败，请稍后再试。");
+      }
     } catch {
       setMessage("删除请求失败，请稍后重试。");
     } finally {
@@ -535,7 +588,7 @@ export function GenerationWorkspace() {
               <button
                 aria-pressed={mode === "text"}
                 className={mode === "text" ? "active" : ""}
-                onClick={() => setMode("text")}
+                onClick={() => handleModeChange("text")}
                 type="button"
               >
                 文生图
@@ -543,7 +596,7 @@ export function GenerationWorkspace() {
               <button
                 aria-pressed={mode === "image"}
                 className={mode === "image" ? "active" : ""}
-                onClick={() => setMode("image")}
+                onClick={() => handleModeChange("image")}
                 type="button"
               >
                 图 + 文
@@ -596,7 +649,11 @@ export function GenerationWorkspace() {
             <div className={mode === "image" ? "upload-zone active" : "upload-zone"}>
               <div>
                 <span>参考图</span>
-                <p>{mode === "image" ? "上传一张或多张参考图，最多建议 16 张。" : "切换到图 + 文模式后可上传参考图。"}</p>
+                <p>
+                  {mode === "image"
+                    ? `上传 PNG、JPEG、WebP 或 GIF，最多 ${IMAGE_INPUT_LIMITS.maxImageCount} 张。`
+                    : "切换到图 + 文模式后可上传参考图。"}
+                </p>
               </div>
               <div className="upload-actions">
                 <button
@@ -610,7 +667,7 @@ export function GenerationWorkspace() {
                 <small>{files.length > 0 ? `已选择 ${files.length} 张` : "尚未选择图片"}</small>
               </div>
               <input
-                accept="image/*"
+                accept={IMAGE_INPUT_LIMITS.allowedMimeTypes.join(",")}
                 className="visually-hidden-input"
                 disabled={mode !== "image"}
                 multiple

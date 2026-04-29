@@ -156,6 +156,51 @@ function getPostgresPool(): Pool {
   return postgresPool;
 }
 
+async function postgresTableExists(pool: Pool, tableName: string): Promise<boolean> {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = $1
+      LIMIT 1
+    `,
+    [tableName]
+  );
+
+  return result.rowCount !== null && result.rowCount > 0;
+}
+
+async function postgresColumnExists(
+  pool: Pool,
+  tableName: string,
+  columnName: string
+): Promise<boolean> {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  return result.rowCount !== null && result.rowCount > 0;
+}
+
+async function addPostgresColumnIfMissing(
+  pool: Pool,
+  tableName: string,
+  columnName: string,
+  definition: string
+): Promise<void> {
+  if (await postgresColumnExists(pool, tableName, columnName)) {
+    return;
+  }
+
+  await pool.query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
 async function ensurePostgresSchema(): Promise<void> {
   const connectionString = getDatabaseUrl();
 
@@ -172,25 +217,46 @@ async function ensurePostgresSchema(): Promise<void> {
   const pending = (async () => {
     const pool = getPostgresPool();
 
+    if (!(await postgresTableExists(pool, "generation_jobs"))) {
+      await pool.query(`
+        CREATE TABLE generation_jobs (
+          id text PRIMARY KEY,
+          dragon_task_id text,
+          client_request_id text UNIQUE,
+          mode text NOT NULL,
+          prompt text NOT NULL,
+          resolution text NOT NULL,
+          size text NOT NULL,
+          status text NOT NULL,
+          progress integer NOT NULL,
+          input_images jsonb NOT NULL DEFAULT '[]'::jsonb,
+          output_images jsonb NOT NULL DEFAULT '[]'::jsonb,
+          error_message text,
+          retry_count integer NOT NULL DEFAULT 0,
+          created_at timestamptz NOT NULL,
+          updated_at timestamptz NOT NULL,
+          completed_at timestamptz
+        )
+      `);
+    }
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "dragon_task_id", "text");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "client_request_id", "text");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "mode", "text NOT NULL DEFAULT 'text'");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "prompt", "text NOT NULL DEFAULT ''");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "resolution", "text NOT NULL DEFAULT '2k'");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "size", "text NOT NULL DEFAULT '1:1'");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "status", "text NOT NULL DEFAULT 'submitted'");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "progress", "integer NOT NULL DEFAULT 0");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "input_images", "jsonb NOT NULL DEFAULT '[]'::jsonb");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "output_images", "jsonb NOT NULL DEFAULT '[]'::jsonb");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "error_message", "text");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "retry_count", "integer NOT NULL DEFAULT 0");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "created_at", "timestamptz NOT NULL DEFAULT now()");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "updated_at", "timestamptz NOT NULL DEFAULT now()");
+    await addPostgresColumnIfMissing(pool, "generation_jobs", "completed_at", "timestamptz");
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS generation_jobs (
-        id text PRIMARY KEY,
-        dragon_task_id text,
-        client_request_id text UNIQUE,
-        mode text NOT NULL,
-        prompt text NOT NULL,
-        resolution text NOT NULL,
-        size text NOT NULL,
-        status text NOT NULL,
-        progress integer NOT NULL,
-        input_images jsonb NOT NULL DEFAULT '[]'::jsonb,
-        output_images jsonb NOT NULL DEFAULT '[]'::jsonb,
-        error_message text,
-        retry_count integer NOT NULL DEFAULT 0,
-        created_at timestamptz NOT NULL,
-        updated_at timestamptz NOT NULL,
-        completed_at timestamptz
-      )
+      CREATE UNIQUE INDEX IF NOT EXISTS generation_jobs_client_request_id_key
+      ON generation_jobs (client_request_id)
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS generation_jobs_created_at_idx
@@ -296,6 +362,10 @@ function buildGenerationJob(input: NewGenerationJob): GenerationJob {
     updatedAt: now,
     completedAt: input.status === "completed" || input.status === "failed" ? now : null
   };
+}
+
+function isTerminalGenerationStatus(status: GenerationStatus): boolean {
+  return status === "completed" || status === "failed";
 }
 
 async function insertPostgresGenerationJob(
@@ -477,6 +547,10 @@ async function updatePostgresGenerationJob(
     return null;
   }
 
+  if (isTerminalGenerationStatus(existing.status)) {
+    return existing;
+  }
+
   const now = new Date().toISOString();
   const status = updates.status ?? existing.status;
   const job: GenerationJob = {
@@ -510,7 +584,7 @@ async function updatePostgresGenerationJob(
         retry_count = $13,
         updated_at = $14,
         completed_at = $15
-      WHERE id = $1
+      WHERE id = $1 AND status NOT IN ('completed', 'failed')
       RETURNING *
     `,
     [
@@ -532,7 +606,7 @@ async function updatePostgresGenerationJob(
     ]
   );
 
-  return result.rows[0] ? rowToGenerationJob(result.rows[0]) : null;
+  return result.rows[0] ? rowToGenerationJob(result.rows[0]) : getPostgresGenerationJob(id);
 }
 
 async function deletePostgresGenerationJob(id: string): Promise<boolean> {
@@ -724,6 +798,11 @@ export async function updateGenerationJob(
 
     const now = new Date().toISOString();
     const existing = data.jobs[index];
+
+    if (isTerminalGenerationStatus(existing.status)) {
+      return existing;
+    }
+
     const status = updates.status ?? existing.status;
     const job: GenerationJob = {
       ...existing,

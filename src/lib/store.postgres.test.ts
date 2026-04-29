@@ -122,4 +122,111 @@ describe("PostgreSQL generation job store", () => {
     expect(second.job.id).toBe(first.job.id);
     expect(rows).toMatchObject([{ id: first.job.id, prompt: "first prompt" }]);
   });
+
+  it("migrates an existing PostgreSQL jobs table before using idempotency columns", async () => {
+    const db = newDb();
+    const { Pool } = db.adapters.createPg();
+
+    db.public.none(`
+      CREATE TABLE generation_jobs (
+        id text PRIMARY KEY,
+        dragon_task_id text,
+        mode text NOT NULL,
+        prompt text NOT NULL,
+        resolution text NOT NULL,
+        size text NOT NULL,
+        status text NOT NULL,
+        progress integer NOT NULL,
+        input_images jsonb NOT NULL DEFAULT '[]'::jsonb,
+        output_images jsonb NOT NULL DEFAULT '[]'::jsonb,
+        error_message text,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL,
+        completed_at timestamptz
+      )
+    `);
+    vi.doMock("pg", () => ({ Pool }));
+    vi.resetModules();
+    process.env.DATABASE_URL = "postgres://studio:secret@localhost/private_image_studio";
+
+    const store = await import("./store");
+    const first = await store.reserveGenerationJob({
+      clientRequestId: "migrated-client-request",
+      dragonTaskId: null,
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "migrated prompt",
+      resolution: "2k",
+      size: "1:1",
+      status: "pending"
+    });
+    const second = await store.reserveGenerationJob({
+      clientRequestId: "migrated-client-request",
+      dragonTaskId: null,
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "duplicate migrated prompt",
+      resolution: "2k",
+      size: "1:1",
+      status: "pending"
+    });
+    const rows = db.public.many("select client_request_id, retry_count from generation_jobs");
+
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(false);
+    expect(second.job.id).toBe(first.job.id);
+    expect(rows).toMatchObject([{ client_request_id: "migrated-client-request", retry_count: 0 }]);
+  });
+
+  it("does not let a stale active update move a terminal PostgreSQL job backwards", async () => {
+    const db = newDb();
+    const { Pool } = db.adapters.createPg();
+
+    vi.doMock("pg", () => ({ Pool }));
+    vi.resetModules();
+    process.env.DATABASE_URL = "postgres://studio:secret@localhost/private_image_studio";
+
+    const store = await import("./store");
+    const job = await store.createGenerationJob({
+      clientRequestId: "terminal-db-job",
+      dragonTaskId: "task_terminal_db",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "finish once",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    const completed = await store.updateGenerationJob(job.id, {
+      status: "completed",
+      progress: 100,
+      outputImages: ["https://example.com/final.png"]
+    });
+
+    const stale = await store.updateGenerationJob(job.id, {
+      status: "pending",
+      progress: 5,
+      outputImages: []
+    });
+    const rows = db.public.many("select id, status, progress, output_images from generation_jobs");
+
+    expect(stale).toEqual(completed);
+    expect(rows).toMatchObject([
+      {
+        id: job.id,
+        status: "completed",
+        progress: 100,
+        output_images: ["https://example.com/final.png"]
+      }
+    ]);
+  });
 });

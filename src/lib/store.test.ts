@@ -111,6 +111,47 @@ describe("generation job store", () => {
     expect(await getGenerationJob(job.id, databasePath)).toEqual(updated);
   });
 
+  it("does not let a stale active update move a terminal JSON job backwards", async () => {
+    const databasePath = await createDatabasePath();
+    const job = await createGenerationJob(
+      {
+        dragonTaskId: "task_terminal_json",
+        mode: "text",
+        prompt: "finish once",
+        resolution: "2k",
+        size: "1:1",
+        status: "submitted",
+        progress: 0,
+        inputImages: [],
+        outputImages: [],
+        errorMessage: null
+      },
+      databasePath
+    );
+    const completed = await updateGenerationJob(
+      job.id,
+      {
+        status: "completed",
+        progress: 100,
+        outputImages: ["https://example.com/final.png"]
+      },
+      databasePath
+    );
+
+    const stale = await updateGenerationJob(
+      job.id,
+      {
+        status: "pending",
+        progress: 5,
+        outputImages: []
+      },
+      databasePath
+    );
+
+    expect(stale).toEqual(completed);
+    expect(await getGenerationJob(job.id, databasePath)).toEqual(completed);
+  });
+
   it("deletes one job without removing the rest of history", async () => {
     const databasePath = await createDatabasePath();
     const first = await createGenerationJob(

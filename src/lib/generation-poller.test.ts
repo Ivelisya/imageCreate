@@ -9,6 +9,7 @@ import {
   listActiveGenerationJobs
 } from "./store";
 import {
+  pollGenerationJobOnce,
   resetGenerationPollingForTests,
   startActiveGenerationPolling,
   startGenerationPolling,
@@ -142,6 +143,82 @@ describe("generation poller", () => {
     expect(await getGenerationJob(job.id)).toMatchObject({
       status: "failed",
       errorMessage: "生成任务超过最长等待时间，已停止轮询。请重新提交任务。"
+    });
+  });
+
+  it("uses the persisted creation time to time out old active jobs after a restart", async () => {
+    vi.setSystemTime(new Date("2026-04-29T00:00:00.000Z"));
+    const job = await createGenerationJob({
+      clientRequestId: "old-active-after-restart",
+      dragonTaskId: "task_old_active",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "old active",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    resetGenerationPollingForTests();
+    vi.setSystemTime(new Date("2026-04-29T00:10:00.000Z"));
+
+    expect(startGenerationPolling(job, { initialDelayMs: 0, maxDurationMs: 60_000 })).toBe(false);
+    await waitForGenerationPollingForTests();
+
+    expect(vi.mocked(fetchDragonTask)).not.toHaveBeenCalled();
+    expect(await getGenerationJob(job.id)).toMatchObject({
+      status: "failed",
+      errorMessage: "生成任务超过最长等待时间，已停止轮询。请重新提交任务。"
+    });
+  });
+
+  it("keeps a completed result when an older concurrent poll resolves as pending later", async () => {
+    const job = await createGenerationJob({
+      clientRequestId: "stale-poll-race",
+      dragonTaskId: "task_race",
+      errorMessage: null,
+      inputImages: [],
+      mode: "text",
+      outputImages: [],
+      progress: 0,
+      prompt: "race",
+      resolution: "2k",
+      size: "1:1",
+      status: "submitted"
+    });
+    let resolveSlowPoll: ((value: Awaited<ReturnType<typeof fetchDragonTask>>) => void) | null = null;
+    vi.mocked(fetchDragonTask)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveSlowPoll = resolve;
+        })
+      )
+      .mockResolvedValueOnce({
+        dragonTaskId: "task_race",
+        errorMessage: null,
+        outputUrls: ["https://example.com/final.png"],
+        progress: 100,
+        status: "completed"
+      });
+
+    const slowPoll = pollGenerationJobOnce(job.id);
+    const fastPoll = pollGenerationJobOnce(job.id);
+    await fastPoll;
+    resolveSlowPoll?.({
+      dragonTaskId: "task_race",
+      errorMessage: null,
+      outputUrls: [],
+      progress: 5,
+      status: "pending"
+    });
+    await slowPoll;
+
+    expect(await getGenerationJob(job.id)).toMatchObject({
+      status: "completed",
+      progress: 100,
+      outputImages: ["https://example.com/final.png"]
     });
   });
 });
