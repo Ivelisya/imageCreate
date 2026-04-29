@@ -709,7 +709,12 @@ export function GenerationWorkspace() {
       showMessage("已填入历史参数，可直接调整后再次生成。", "success");
     }
 
-    document.getElementById("composer-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.requestAnimationFrame(() => {
+      document.getElementById("composer-panel")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+      });
+    });
   }
 
   function toggleJobSelection(jobId: string) {
@@ -853,13 +858,13 @@ export function GenerationWorkspace() {
         </div>
       </header>
       <nav className="mobile-quick-nav" aria-label="工作台快捷导航">
-        <a href="#composer-title">创作</a>
+        <a href="#composer-panel">创作</a>
         <a href="#result-title">结果</a>
         <a href="#history-title">历史</a>
       </nav>
 
       <div className="workspace-grid">
-        <section className="panel composer-panel" aria-labelledby="composer-title">
+        <section className="panel composer-panel" id="composer-panel" aria-labelledby="composer-title">
           <div className="panel-heading">
             <div>
               <p className="panel-kicker">创作输入</p>

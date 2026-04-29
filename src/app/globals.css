@@ -855,6 +855,10 @@ a:focus-visible {
   top: var(--space-lg);
 }
 
+.composer-panel {
+  scroll-margin-top: var(--space-lg);
+}
+
 .result-panel {
   min-height: calc(100vh - 156px);
 }
@@ -1572,6 +1576,7 @@ a:focus-visible {
 
   .composer-panel {
     position: static;
+    scroll-margin-top: calc(68px + var(--space-md));
   }
 
   .panel {
