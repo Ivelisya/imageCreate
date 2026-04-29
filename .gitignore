@@ -1,0 +1,13 @@
+node_modules
+.next
+out
+dist
+.env
+.env.local
+data
+*.log
+coverage
+.codex-skill-download
+outputs
+slides_plan.*
+generate-static-check.png
